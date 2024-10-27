@@ -133,6 +133,7 @@ class EventToSalienceMap:
             get_angle = self.get_angle_for_4s_sweep  # Default angle method
 
         t_min, t_max = 0, dt
+
         data = torch.zeros((self.camera_res_x, self.camera_res_y), device=self.device)
 
         # Get the last timestamp
@@ -166,7 +167,7 @@ class EventToSalienceMap:
             t_max += dt
 
             # Yield the spikes generated in this timestep
-            yield spikes
+            yield spikes, x_start
     def build_convolutional_snn_for_on_centre(self):
         """
         Builds a convolutional SNN to generate the on-centre edge map from the off-centre spike input.
@@ -189,12 +190,15 @@ class EventToSalienceMap:
                 self.mem1 = None
                 self.mem2 = None
                 self.mem3 = None
-
+                """
                 # Apply Xavier initialization
                 init.xavier_uniform_(self.conv1.weight)
                 init.xavier_uniform_(self.conv2.weight)
                 init.xavier_uniform_(self.conv3.weight)
-
+                """
+                init.uniform_(self.conv1.weight, a=0.1, b=0.5)
+                init.uniform_(self.conv2.weight, a=0.1, b=0.5)
+                init.uniform_(self.conv3.weight, a=0.1, b=0.3)
             def forward(self, x, reset_mem=False):
                 if reset_mem:
                     self.mem1 = None
@@ -234,7 +238,7 @@ class EventToSalienceMap:
         model = ConvSNNOnCentre().to(self.device)
         return model
 
-    def train_on_centre_SNN_tempo_aligned(self, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=20,
+    def train_on_centre_SNN_tempo_aligned(self, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=10,
                             early_stopping=False, patience=5, learning_rate=1e-3, plot_training=True, device_ids=None):
         """
         Trains the convolutional SNN for generating on-centre edge maps.
@@ -256,7 +260,7 @@ class EventToSalienceMap:
         train_scenes, val_scenes, test_scenes = self._split_dataset(data_dir, ignore_file, split_ratio)
 
         # Save the scene lists to text files
-        self.save_scene_lists(train_scenes, val_scenes, test_scenes)
+        self.save_scene_lists(train_scenes, val_scenes, test_scenes, "temp_aligned_")
 
         # Initialize the SNN model and optimizer
         model = self.build_convolutional_snn_for_on_centre()
@@ -272,7 +276,7 @@ class EventToSalienceMap:
         train_accuracy_history, val_accuracy_history = [], []
 
         # Training Loop
-        for epoch in tqdm(range(epochs), desc="Expochs"):
+        for epoch in tqdm(range(epochs), desc="Epochs"):
             model.train()  # Set model to training mode
             train_loss, train_correct, total_train = 0, 0, 0
 
@@ -280,22 +284,21 @@ class EventToSalienceMap:
             for scene in train_scenes:
                 print(scene)
                 off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-                print("Scene loaded")
-                #  Accumulate spikes for the on-centre data (binary mask)
+                print("Scene {} loaded".format(scene))
 
                 reset_mem=True
                 i=0
-                for off_spikes, on_spikes in zip(self.update_events_step_by_step(off_centre_spikes),
-                                                 self.update_events_step_by_step(on_centre_spikes)):
+                for (off_spikes, _), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
+                                                           self.update_events_step_by_step(on_centre_spikes)):
                     print("Frame ", i)
                     optimizer.zero_grad()
                     model.reset_state()
 
                     # Forward pass
                     predictions = model(off_spikes.unsqueeze(0).unsqueeze(0), reset_mem=reset_mem)  # Add batch and channel dimensions
-                    reset_mem=True
+                    reset_mem=True #reset membrane potentials for every frame
                     # Compare predictions against the spike mask (not individual frames)
-                    loss = self._calculate_loss_tempo_aligned(predictions.squeeze(), on_spikes, off_spikes)
+                    loss = self._calculate_loss_tempo_aligned(predictions.squeeze(), on_spikes)
 
                     # Backward pass and optimize
                     loss.backward()
@@ -309,7 +312,7 @@ class EventToSalienceMap:
                     train_correct += (predictions.squeeze().bool() == on_spikes.bool()).sum().item()
                     i+=1
 
-
+            torch.cuda.empty_cache()
             # Average training loss and accuracy
             avg_train_loss = train_loss / len(train_scenes)
             train_accuracy = train_correct / total_train
@@ -325,8 +328,8 @@ class EventToSalienceMap:
                 for scene in val_scenes:
                     off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
 
-                    for off_spikes, on_spikes in zip(self.update_events_step_by_step(off_centre_spikes),
-                                                     self.update_events_step_by_step(on_centre_spikes)):
+                    for (off_spikes, _), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
+                                                               self.update_events_step_by_step(on_centre_spikes)):
                         predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
                         loss = self._calculate_loss_tempo_aligned(predictions, on_spikes)
 
@@ -357,7 +360,7 @@ class EventToSalienceMap:
                     break
 
         torch.save(model.state_dict(), "Temp_alligned_model.pth")
-
+        torch.cuda.empty_cache()
         # Step 5: Testing
         print("Testing model on test set...")
         model.load_state_dict(torch.load("best_model.pth"))  # Load best model
@@ -366,7 +369,7 @@ class EventToSalienceMap:
         with torch.no_grad():
             for scene in test_scenes:
                 off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-                for off_spikes, on_spikes in zip(self.update_events_step_by_step(off_centre_spikes),
+                for (off_spikes, _), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
                                                  self.update_events_step_by_step(on_centre_spikes)):
                     predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
                     loss = self._calculate_loss_tempo_aligned(predictions, on_spikes)
@@ -374,19 +377,23 @@ class EventToSalienceMap:
                     # Accumulate metrics
                     test_loss += loss.item()
                     total_test += on_spikes.numel()
-                    test_correct += torch.sum(predictions*on_spikes).item()
+                    test_correct += (predictions.squeeze().bool() == on_spikes.bool()).sum().item()
 
         avg_test_loss = test_loss / len(test_scenes)
         test_accuracy = test_correct / total_test
         print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}")
 
+        self.save_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history,
+                                   save_dir="temp_aligned_training_logs")
+
         # Step 6: Plot Training History
         if plot_training:
             self._plot_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history)
-    def train_on_centre_SNN(self, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=20,
-                            early_stopping=False, patience=5, learning_rate=1e-3, plot_training=True):
+    def train_on_centre_SNN_tempo_independent(self, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=10,
+                            early_stopping=False, patience=5, learning_rate=1e-3, plot_training=True, device_ids=None):
         """
-        Trains the convolutional SNN for generating on-centre edge maps.
+        Trains the convolutional SNN for generating on-centre edge maps. The training is temporal independent. A spike mask
+        is created that contains the spikes of all frames of the training scene, while the input remains frame by frame.
 
         Parameters:
             data_dir (str): Path to the dataset directory (where the scene folders are stored).
@@ -397,6 +404,7 @@ class EventToSalienceMap:
             patience (int): Patience for early stopping (only applies if early_stopping=True). Default is 5.
             learning_rate (float): Learning rate for the Adam optimizer. Default is 1e-3.
             plot_training (bool): If True, saves a plot of the training and validation loss/accuracy. Default is True.
+            device_ids (tulple): Contains devices to train on, if None trains on initialized device. Default is None
         """
         # Load Dataset and Split into Train/Validation/Test
         print("Loading dataset paths...")
@@ -404,8 +412,12 @@ class EventToSalienceMap:
 
         train_scenes, val_scenes, test_scenes = self._split_dataset(data_dir, ignore_file, split_ratio)
 
+        self.save_scene_lists(train_scenes, val_scenes, test_scenes, "temp_independent_")
+
         # Initialize the SNN model and optimizer
         model = self.build_convolutional_snn_for_on_centre()
+        if device_ids:
+            model = torch.nn.DataParallel(model, device_ids=device_ids)
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 
@@ -423,34 +435,35 @@ class EventToSalienceMap:
             # Process training data one scene at a time
             for scene in train_scenes:
                 off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-                print("Scene loaded")
+                print("Scene {} loaded".format(scene))
                 #  Accumulate spikes for the on-centre data (binary mask)
                 spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
                 reset_mem=True
                 i=0
-                for off_spikes in self.update_events_step_by_step(off_centre_spikes):
+                for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
                     print("Frame ", i)
                     optimizer.zero_grad()
                     model.reset_state()
 
                     # Forward pass
                     predictions = model(off_spikes.unsqueeze(0).unsqueeze(0), reset_mem=reset_mem)  # Add batch and channel dimensions
-                    reset_mem=False
+                    reset_mem=False # Membrane potential is carried on (No reset).
                     # Compare predictions against the spike mask (not individual frames)
-                    loss = self._calculate_loss(predictions.squeeze(), spike_mask, off_spikes)
+                    loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
 
                     # Backward pass and optimize
                     loss.backward()
                     optimizer.step()
+                    torch.cuda.empty_cache()
 
                     # Accumulate metrics
                     train_loss += loss.item()
-                    total_train += spike_mask.numel()
+                    total_train += self.camera_res_x*self.camera_res_y
                     # Correct spikes (reward)
-                    train_correct += ((predictions.squeeze() > 0.5).bool() & spike_mask.bool()).sum().item()
+                    train_correct += self._n_correct_spikes_in_frame(spike_mask, predictions, x_start)
                     i+=1
 
-
+            torch.cuda.empty_cache()
             # Average training loss and accuracy
             avg_train_loss = train_loss / len(train_scenes)
             train_accuracy = train_correct / total_train
@@ -468,14 +481,14 @@ class EventToSalienceMap:
 
                     spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
 
-                    for off_spikes in self.update_events_step_by_step(off_centre_spikes):
+                    for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
                         predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
-                        loss = self._calculate_loss(predictions, spike_mask)
+                        loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
 
                         # Accumulate metrics
                         val_loss += loss.item()
-                        total_val += spike_mask.numel()
-                        train_correct += ((predictions.squeeze() > 0.5).bool() & spike_mask.bool()).sum().item()
+                        total_val += self.camera_res_x*self.camera_res_y
+                        train_correct += self._n_correct_spikes_in_frame(spike_mask, predictions, x_start)
 
             # Average validation loss and accuracy
             avg_val_loss = val_loss / len(val_scenes)
@@ -498,29 +511,34 @@ class EventToSalienceMap:
                     print("Early stopping triggered.")
                     break
 
-        # Step 5: Testing
+        torch.save(model.state_dict(), "Temp_independent_model.pth")
+        torch.cuda.empty_cache()
+        # Testing
         print("Testing model on test set...")
-        model.load_state_dict(torch.load("best_model.pth"))  # Load best model
+        model.load_state_dict(torch.load("Temp_independent_model.pth"))  # Load best model
         test_loss, test_correct, total_test = 0, 0, 0
         model.eval()
         with torch.no_grad():
             for scene in test_scenes:
                 off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-                for off_spikes, on_spikes in zip(self.update_events_step_by_step(off_centre_spikes),
-                                                 self.update_events_step_by_step(on_centre_spikes)):
+
+                spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
+                for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
                     predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
-                    loss = self._calculate_loss(predictions, on_spikes)
+                    loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
 
                     # Accumulate metrics
                     test_loss += loss.item()
-                    total_test += on_spikes.numel()
-                    test_correct += (predictions > 0.5).eq(on_spikes).sum().item()
+                    total_test += self.camera_res_x*self.camera_res_y
+                    test_correct += self._n_correct_spikes_in_frame(spike_mask, predictions, x_start)
 
         avg_test_loss = test_loss / len(test_scenes)
         test_accuracy = test_correct / total_test
         print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}")
 
-        # Step 6: Plot Training History
+        self.save_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history, save_dir="temp_indep_training_logs")
+
+        # Plot Training History
         if plot_training:
             self._plot_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history)
 
@@ -538,28 +556,81 @@ class EventToSalienceMap:
         spike_mask = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
 
         # Iterate over the event sequence and accumulate spikes
-        for on_spikes in self.update_events_step_by_step(on_centre_events):
+        for on_spikes, _ in self.update_events_step_by_step(on_centre_events):
             spike_mask = torch.max(spike_mask, (on_spikes > 0).float())  # Update spike mask: 1 if spiked at least once
 
         return spike_mask
 
-    def save_scene_lists(self, train_scenes, val_scenes, test_scenes):
+    def _n_correct_spikes_in_frame(self, target_mask, prediction, x_start):
+        """
+        While the target-maks contains the spikes of all/multiple frames,
+         this will only count the correct spikes within this frame
+
+        Parameters:
+            target_mask (torch.Tensor): Contains spikes of multiple/all frames.
+            prediction (torch.Tensor): Contains the prediction for this frame
+            x_start: Starting point of frame to be returned.
+
+        Returns:
+             n_correct (int): The number of correct prediction with respect to the target-mask
+        """
+        x_end = x_start + self.camera_res_x
+        n_correct = 0
+
+        if x_end > len(target_mask):
+            split_idx = len(target_mask) - x_start
+            n_correct += (prediction.squeeze()[x_start:].bool() == target_mask[x_start:].bool()).sum().item()
+            n_correct += (prediction.squeeze()[:x_end % len(target_mask)].bool() == target_mask[:x_end % len(target_mask)].bool()).sum().item()
+        else:
+            n_correct += (prediction.squeeze()[x_start:x_end].bool() == target_mask[x_start:x_end].bool()).sum().item()
+
+        return n_correct
+
+    def save_training_history(self, train_loss, val_loss, train_accuracy, val_accuracy, save_dir="training_logs"):
+        import os
+
+        # Ensure the directory exists
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save each list to a separate file
+        with open(os.path.join(save_dir, "train_loss_history.txt"), "w") as f:
+            for item in train_loss:
+                f.write(f"{item}\n")
+
+        with open(os.path.join(save_dir, "val_loss_history.txt"), "w") as f:
+            for item in val_loss:
+                f.write(f"{item}\n")
+
+        with open(os.path.join(save_dir, "train_accuracy_history.txt"), "w") as f:
+            for item in train_accuracy:
+                f.write(f"{item}\n")
+
+        with open(os.path.join(save_dir, "val_accuracy_history.txt"), "w") as f:
+            for item in val_accuracy:
+                f.write(f"{item}\n")
+
+        print(f"Training history saved in '{save_dir}'")
+
+    # Example usage:
+    save_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history)
+
+    def save_scene_lists(self, train_scenes, val_scenes, test_scenes, name):
         """
         Saves the train, validation, and test scene lists to text files.
         Files are overwritten if they already exist.
         """
         # Save train scenes
-        with open('train_list.txt', 'w') as train_file:
+        with open(name+'train_list.txt', 'w') as train_file:
             for scene in train_scenes:
                 train_file.write(f"{scene}\n")
 
         # Save validation scenes
-        with open('validation_list.txt', 'w') as val_file:
+        with open(name+'validation_list.txt', 'w') as val_file:
             for scene in val_scenes:
                 val_file.write(f"{scene}\n")
 
         # Save test scenes
-        with open('test_list.txt', 'w') as test_file:
+        with open(name+'test_list.txt', 'w') as test_file:
             for scene in test_scenes:
                 test_file.write(f"{scene}\n")
 
@@ -597,19 +668,27 @@ class EventToSalienceMap:
 
         return off_centre_events, on_centre_events
 
-    def _calculate_loss(self, predictions, targets, input_spikes):
+    def _calculate_loss_temp_indep(self, predictions, targets, x_start):
         """
         Custom loss function to measure performance based on spiking correctness and sparsity.
         - Penalizes false positives (predicted 1 when target is 0).
-        - Rewards true positives (predicted 1 when target is 1).
+        - Rewards true positives (predicted 1 when target is 1), but only within the current frame to fore come too
+          much spiking.
         - Does not punish 'wrong' 0 predictions (false negatives or true negatives).
         - Adds a sparsity penalty to discourage excessive spiking.
         """
-
+        x_end = x_start + self.camera_res_x
         # Apply surrogate_grad
         surrogate_grad = surrogate.fast_sigmoid(slope=25)
-        # Reward for correct 1s (True Positives)
-        true_positive_reward = surrogate_grad(predictions) * targets
+        # Reward for correct 1s (True Positives) only in current frame
+        if x_end > len(targets):
+            true_positive_reward =torch.cat((surrogate_grad(predictions[x_start:]) * targets[x_start:],
+                                            surrogate_grad(predictions[:x_end % len(targets)]) * targets[:x_end % len(targets)]),0 )
+            n_spikes_in_frame = targets[x_start:].sum().item()
+            n_spikes_in_frame+= targets[:x_end % len(targets)].sum().item()
+        else:
+            true_positive_reward = surrogate_grad(predictions[x_start:x_end]) * targets[x_start:x_end]
+            n_spikes_in_frame = targets[x_start:x_end].sum().item()
 
         # Penalize false positives (predicted 1, but target is 0)
         false_positive_penalty = surrogate_grad(predictions) * (1 - targets)
@@ -619,24 +698,24 @@ class EventToSalienceMap:
         sparsity_penalty = torch.mean(predictions)
 
         weight_true_pos = -1
-        weight_false_pos = 5
+        weight_false_pos = 0.5
         weight_sparsity = 0.1
         # Total loss:
         # - Reward for true positives (maximize correct spikes),
         # - Penalty for false positives (minimize incorrect spikes),
         # - Sparsity penalty to avoid excessive spiking.
         total_loss = (
-                weight_true_pos * true_positive_reward.sum() / torch.sum(input_spikes) +  # reward for correct spikes
-                weight_false_pos * false_positive_penalty.sum() / torch.sum(input_spikes) +  # penalize incorrect spikes
+                weight_true_pos * true_positive_reward.sum() / n_spikes_in_frame +  # reward for correct spikes
+                weight_false_pos * false_positive_penalty.sum() / n_spikes_in_frame +  # penalize incorrect spikes
                 weight_sparsity * sparsity_penalty  # encourage sparse activity
         )
-        print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / input_spikes.sum().item())
-        print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / input_spikes.sum().item())
+        print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / n_spikes_in_frame)
+        print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / n_spikes_in_frame)
         print("spartity:" ,sparsity_penalty.item(), weight_sparsity * sparsity_penalty.item())
         print("loss:", total_loss)
         return total_loss
 
-    def _calculate_loss_tempo_aligned(self, predictions, targets, input_spikes):
+    def _calculate_loss_tempo_aligned(self, predictions, targets):
         """
         Custom loss function to measure performance based on spiking correctness and sparsity.
         - Penalizes false positives (predicted 1 when target is 0).
@@ -665,12 +744,12 @@ class EventToSalienceMap:
         # - Penalty for false positives (minimize incorrect spikes),
         # - Sparsity penalty to avoid excessive spiking.
         total_loss = (
-                weight_true_pos * true_positive_reward.sum() / torch.sum(input_spikes) +  # reward for correct spikes
-                weight_false_pos * false_positive_penalty.sum() / torch.sum(input_spikes) +  # penalize incorrect spikes
+                weight_true_pos * true_positive_reward.sum() / torch.sum(targets) +  # reward for correct spikes
+                weight_false_pos * false_positive_penalty.sum() / torch.sum(targets) +  # penalize incorrect spikes
                 weight_sparsity * sparsity_penalty  # encourage sparse activity
         )
-        print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / input_spikes.sum().item())
-        print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / input_spikes.sum().item())
+        print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / targets.sum().item())
+        print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / targets.sum().item())
         print("spartity:" ,sparsity_penalty.item(), weight_sparsity * sparsity_penalty.item())
         print("loss:", total_loss)
         return total_loss

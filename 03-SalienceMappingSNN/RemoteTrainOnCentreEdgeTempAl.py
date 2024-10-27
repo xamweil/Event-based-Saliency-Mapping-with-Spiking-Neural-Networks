@@ -18,7 +18,7 @@ def main():
     device_ids = [int(id.strip()) for id in args.device_ids.split(",")]
 
     # Run the training process
-    # Initialize the EventToSalienceMap with the first device (e.g., cuda:0)
+    # Initialize the EventToSalienceMap with the first passed device
     event = EventToSalienceMap(device=f"cuda:{device_ids[0]}")
     event.train_on_centre_SNN_tempo_aligned(data_dir, ignore_file, device_ids=device_ids)
 
