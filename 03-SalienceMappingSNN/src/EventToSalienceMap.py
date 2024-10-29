@@ -611,8 +611,6 @@ class EventToSalienceMap:
 
         print(f"Training history saved in '{save_dir}'")
 
-    # Example usage:
-    save_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history)
 
     def save_scene_lists(self, train_scenes, val_scenes, test_scenes, name):
         """
