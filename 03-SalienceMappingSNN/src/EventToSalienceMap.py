@@ -190,7 +190,7 @@ class EventToSalienceMap:
                 self.mem1 = None
                 self.mem2 = None
                 self.mem3 = None
-                """
+                #"""
                 # Apply Xavier initialization
                 init.xavier_uniform_(self.conv1.weight)
                 init.xavier_uniform_(self.conv2.weight)
@@ -199,6 +199,7 @@ class EventToSalienceMap:
                 init.uniform_(self.conv1.weight, a=0.1, b=0.5)
                 init.uniform_(self.conv2.weight, a=0.1, b=0.5)
                 init.uniform_(self.conv3.weight, a=0.1, b=0.3)
+                """
             def forward(self, x, reset_mem=False):
                 if reset_mem:
                     self.mem1 = None
@@ -276,21 +277,27 @@ class EventToSalienceMap:
         train_accuracy_history, val_accuracy_history = [], []
 
         # Training Loop
-        for epoch in tqdm(range(epochs), desc="Epochs"):
+
+        for epoch in range(epochs):
+            pbar = tqdm(train_scenes, total=len(train_scenes),
+                        desc="Training: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
             model.train()  # Set model to training mode
             train_loss, train_correct, total_train = 0, 0, 0
 
             # Process training data one scene at a time
-            for scene in train_scenes:
-                print(scene)
-                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-                print("Scene {} loaded".format(scene))
 
+            for scene in pbar:
+                pbar.set_description("Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch,
+                                                                                       sc=scene, fr="-"))
+                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+
+                frame=0
                 reset_mem=True
-                i=0
-                for (off_spikes, _), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
+                for (off_spikes, x_start), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
                                                            self.update_events_step_by_step(on_centre_spikes)):
-                    print("Frame ", i)
+
+
                     optimizer.zero_grad()
                     model.reset_state()
 
@@ -299,6 +306,16 @@ class EventToSalienceMap:
                     reset_mem=True #reset membrane potentials for every frame
                     # Compare predictions against the spike mask (not individual frames)
                     loss = self._calculate_loss_tempo_aligned(predictions.squeeze(), on_spikes)
+
+                    # Update progress Bar
+                    pbar.set_description("Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc=round((on_spikes == predictions.squeeze()).sum().item() / (self.layer1_n_neurons_x*self.layer1_n_neurons_y), 4),
+                            acc_fr = round(self._get_accuracy_in_frame(predictions.squeeze(), on_spikes, x_start), 4),
+                            fp=(predictions.squeeze() * (1 - on_spikes)).sum().item(),
+                            fn=((1 - predictions.squeeze()) * on_spikes).sum().item(),
+                            l=round(loss.item(),4), ep=epoch, sc=scene,
+                            fr = frame
+                            ))
 
                     # Backward pass and optimize
                     loss.backward()
@@ -310,8 +327,8 @@ class EventToSalienceMap:
                     total_train += on_spikes.numel()
                     # Correct spikes (reward)
                     train_correct += (predictions.squeeze().bool() == on_spikes.bool()).sum().item()
-                    i+=1
 
+                    frame+=1
             torch.cuda.empty_cache()
             # Average training loss and accuracy
             avg_train_loss = train_loss / len(train_scenes)
@@ -319,24 +336,41 @@ class EventToSalienceMap:
             train_loss_history.append(avg_train_loss)
             train_accuracy_history.append(train_accuracy)
 
-            print(f"Epoch [{epoch + 1}/{epochs}] - Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}")
-
+            print(f"\r\n - Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}", end="\n")
+            #save model for
+            torch.save(model.state_dict(), "{}_epoch_Temp_alligned_model.pth".format(epoch))
             # Step 4: Validation
             model.eval()  # Set model to evaluation mode
             val_loss, val_correct, total_val = 0, 0, 0
             with torch.no_grad():
-                for scene in val_scenes:
+                pbar = tqdm(val_scenes, total=len(val_scenes),
+                            desc="Validation: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
+                for scene in pbar:
+                    pbar.set_description("Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                                        acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
                     off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
 
-                    for (off_spikes, _), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
+                    frame = 0
+                    for (off_spikes, x_start), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
                                                                self.update_events_step_by_step(on_centre_spikes)):
                         predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
                         loss = self._calculate_loss_tempo_aligned(predictions, on_spikes)
+
+                        # Update progress Bar
+                        pbar.set_description("Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc=round((on_spikes == predictions.squeeze()).sum().item() / (self.layer1_n_neurons_x*self.layer1_n_neurons_y), 4),
+                            acc_fr = round(self._get_accuracy_in_frame(predictions.squeeze(), on_spikes, x_start), 4),
+                            fp=(predictions.squeeze() * (1 - on_spikes)).sum().item(),
+                            fn=((1 - predictions.squeeze()) * on_spikes).sum().item(),
+                            l=round(loss.item(),4), ep=epoch, sc=scene,
+                            fr = frame))
 
                         # Accumulate metrics
                         val_loss += loss.item()
                         total_val += on_spikes.numel()
                         val_correct += (predictions.squeeze().bool() == on_spikes.bool()).sum().item()
+                        frame +=1
 
             # Average validation loss and accuracy
             avg_val_loss = val_loss / len(val_scenes)
@@ -344,7 +378,7 @@ class EventToSalienceMap:
             val_loss_history.append(avg_val_loss)
             val_accuracy_history.append(val_accuracy)
 
-            print(f"Epoch [{epoch + 1}/{epochs}] - Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
+            print(f"\r\n- Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}", end="\n")
 
             # Early stopping logic
             if early_stopping:
@@ -359,11 +393,11 @@ class EventToSalienceMap:
                     print("Early stopping triggered.")
                     break
 
-        torch.save(model.state_dict(), "Temp_alligned_model.pth")
+        torch.save(model.state_dict(), "Temp_aligned_model.pth")
         torch.cuda.empty_cache()
         # Step 5: Testing
         print("Testing model on test set...")
-        model.load_state_dict(torch.load("best_model.pth"))  # Load best model
+        model.load_state_dict(torch.load("Temp_aligned_model.pth"))  # Load best model
         test_loss, test_correct, total_test = 0, 0, 0
         model.eval()
         with torch.no_grad():
@@ -428,20 +462,26 @@ class EventToSalienceMap:
         train_accuracy_history, val_accuracy_history = [], []
 
         # Training Loop
-        for epoch in tqdm(range(epochs), desc="Expochs"):
+        for epoch in range(epochs):
+            pbar = tqdm(train_scenes, total=len(train_scenes),
+                        desc="Training: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
             model.train()  # Set model to training mode
             train_loss, train_correct, total_train = 0, 0, 0
 
             # Process training data one scene at a time
-            for scene in train_scenes:
+            for scene in pbar:
+                pbar.set_description(
+                    "Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                        acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
                 off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-                print("Scene {} loaded".format(scene))
+
                 #  Accumulate spikes for the on-centre data (binary mask)
                 spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
                 reset_mem=True
-                i=0
+                frame=0
                 for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
-                    print("Frame ", i)
+
                     optimizer.zero_grad()
                     model.reset_state()
 
@@ -450,6 +490,16 @@ class EventToSalienceMap:
                     reset_mem=False # Membrane potential is carried on (No reset).
                     # Compare predictions against the spike mask (not individual frames)
                     loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
+
+                    # Update progress Bar
+                    pbar.set_description(
+                        "Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc=round(self._get_accuracy_mask_training(predictions.squeeze(), spike_mask, x_start), 4),
+                            acc_fr=round(self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start), 4),
+                            fp=self._get_false_positive_mask_training(predictions.squeeze(), spike_mask, x_start),
+                            fn=self._get_false_negative_mask_training(predictions.squeeze(), spike_mask, x_start),
+                            l=round(loss.item(), 4), ep=epoch, sc=scene, fr=frame
+                        ))
 
                     # Backward pass and optimize
                     loss.backward()
@@ -460,8 +510,8 @@ class EventToSalienceMap:
                     train_loss += loss.item()
                     total_train += self.camera_res_x*self.camera_res_y
                     # Correct spikes (reward)
-                    train_correct += self._n_correct_spikes_in_frame(spike_mask, predictions, x_start)
-                    i+=1
+                    train_correct += self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start)
+                    frame+=1
 
             torch.cuda.empty_cache()
             # Average training loss and accuracy
@@ -470,25 +520,52 @@ class EventToSalienceMap:
             train_loss_history.append(avg_train_loss)
             train_accuracy_history.append(train_accuracy)
 
-            print(f"Epoch [{epoch + 1}/{epochs}] - Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}")
+
+            print(f"\r\n - Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}", end="\n")
+            # save model for
+            torch.save(model.state_dict(), "{}_epoch_Temp_indep_model.pth".format(epoch))
 
             # Step 4: Validation
             model.eval()  # Set model to evaluation mode
             val_loss, val_correct, total_val = 0, 0, 0
             with torch.no_grad():
-                for scene in val_scenes:
+                pbar = tqdm(val_scenes, total=len(val_scenes),
+                            desc="Validation: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                                acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
+                for scene in pbar:
+                    pbar.set_description("Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
+
+                    # Load scene data
                     off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
 
+                    # Generate spike mask
                     spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
+                    frame = 0
 
                     for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
+
                         predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
                         loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
+
+                        # Update progress Bar
+                        pbar.set_description(
+                            "Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                                acc=round(self._get_accuracy_mask_training(predictions.squeeze(), spike_mask, x_start),
+                                          4),
+                                acc_fr=round(self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start),
+                                             4),
+                                fp=self._get_false_positive_mask_training(predictions.squeeze(), spike_mask, x_start),
+                                fn=self._get_false_negative_mask_training(predictions.squeeze(), spike_mask, x_start),
+                                l=round(loss.item(), 4), ep=epoch, sc=scene, fr=frame
+                            ))
+                        torch.cuda.empty_cache()
 
                         # Accumulate metrics
                         val_loss += loss.item()
                         total_val += self.camera_res_x*self.camera_res_y
-                        train_correct += self._n_correct_spikes_in_frame(spike_mask, predictions, x_start)
+                        train_correct += self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start)
+                        frame +=1
 
             # Average validation loss and accuracy
             avg_val_loss = val_loss / len(val_scenes)
@@ -496,7 +573,7 @@ class EventToSalienceMap:
             val_loss_history.append(avg_val_loss)
             val_accuracy_history.append(val_accuracy)
 
-            print(f"Epoch [{epoch + 1}/{epochs}] - Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
+            print(f"\r\n - Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}", end="\n")
 
             # Early stopping logic
             if early_stopping:
@@ -519,7 +596,13 @@ class EventToSalienceMap:
         test_loss, test_correct, total_test = 0, 0, 0
         model.eval()
         with torch.no_grad():
+            pbar = tqdm(test_scenes, total=len(test_scenes),
+                        desc="Testing: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
             for scene in test_scenes:
+                pbar.set_description(
+                    "Testing: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                        acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
                 off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
 
                 spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
@@ -527,10 +610,23 @@ class EventToSalienceMap:
                     predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
                     loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
 
+                    # Update progress Bar
+                    pbar.set_description(
+                        "Testing: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            acc=round(self._get_accuracy_mask_training(predictions.squeeze(), spike_mask, x_start),
+                                      4),
+                            acc_fr=round(self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start),
+                                         4),
+                            fp=self._get_false_positive_mask_training(predictions.squeeze(), spike_mask, x_start),
+                            fn=self._get_false_negative_mask_training(predictions.squeeze(), spike_mask, x_start),
+                            l=round(loss.item(), 4), ep=epoch, sc=scene, fr=frame
+                        ))
+                    torch.cuda.empty_cache()
+
                     # Accumulate metrics
                     test_loss += loss.item()
                     total_test += self.camera_res_x*self.camera_res_y
-                    test_correct += self._n_correct_spikes_in_frame(spike_mask, predictions, x_start)
+                    test_correct += self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start)
 
         avg_test_loss = test_loss / len(test_scenes)
         test_accuracy = test_correct / total_test
@@ -541,6 +637,107 @@ class EventToSalienceMap:
         # Plot Training History
         if plot_training:
             self._plot_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history)
+    def _get_accuracy_in_frame(self, prediction, target, x_start):
+        """
+        calculates the ratio of equal entries between two tensors.
+
+        Parameters:
+            prediction (torch.Tensor): Tensor that holds the predictions
+            target (torch.Tensor): Tensor that holds the targets
+            x_start (int): Holds the start position of the frame
+
+        Return:
+             Ratio of correct predictions in one frame.
+        """
+        x_end = x_start+self.camera_res_x
+        if x_end > len(target):
+            acc = torch.cat((prediction[x_start:]==target[x_start:], prediction[:x_end%len(target)]==target[:x_end%len(target)]))
+        else:
+            acc = prediction[x_start:x_end]==target[x_start:x_end]
+        return acc.sum().item()/(self.camera_res_x*self.camera_res_y)
+
+    def _get_accuracy_mask_training(self, predictions, target_mask, x_start):
+        """
+        Calculates the accuracy from the part of the mask that already had an input, up to the current frame.
+        Assumes a sweep that starts at x=0.
+
+        Parameters:
+            predictions (torch.Tensor): Tensor with prediction spikes.
+
+            target_mask (torch.Tensor): Tensor with target spikes containing the spikes of all frames.
+
+            x_start (int): Start position of current frame.
+
+        Return:
+             acc (float): accuracy of predictions up to the current frame.
+        """
+
+        x_end = x_start+self.camera_res_x
+
+        if x_end > len(target_mask):
+            N = len(target_mask)*self.camera_res_y
+            acc = (predictions == target_mask).sum().item()/N
+        else:
+            N = x_end *self.camera_res_y
+            acc = (predictions[:x_end] == target_mask[x_end]).sum().item()/N
+
+        return acc
+
+    def _get_false_positive_mask_training(self, predictions, target_mask, x_start):
+        """
+        Calculates the false positives from the part of the mask that already had an input, up to the current frame.
+        Assumes a sweep that starts at x=0.
+
+        Parameters:
+            predictions (torch.Tensor): Tensor with prediction spikes.
+
+            target_mask (torch.Tensor): Tensor with target spikes containing the spikes of all frames.
+
+            x_start (int): Start position of current frame.
+
+        Return:
+            fp (int): Number of false positives up to the current frame.
+        """
+        x_end = x_start + self.camera_res_x
+
+        if x_end > len(target_mask):
+            N = len(target_mask) * self.camera_res_y
+            fp = (predictions * (1-target_mask)).sum().item() / N
+        else:
+            N = x_end * self.camera_res_y
+            fp = (predictions[:x_end] * (1-target_mask[x_end])).sum().item() / N
+
+        return fp
+
+    def _get_false_negative_mask_training(self, predictions, target_mask, x_start):
+        """
+        Calculates the false negatives from the part of the mask that already had an input, up to the current frame.
+        Assumes a sweep that starts at x=0.
+
+        Note: This number might be quite high as the membrane potentials decay over time, producing a false
+            negative that is not a problem.
+
+        Parameters:
+            predictions (torch.Tensor): Tensor with prediction spikes.
+
+            target_mask (torch.Tensor): Tensor with target spikes containing the spikes of all frames.
+
+            x_start (int): Start position of current frame.
+
+        Return:
+            fn (int): Number of false negatives up to the current frame.
+        """
+        x_end = x_start + self.camera_res_x
+
+        if x_end > len(target_mask):
+            N = len(target_mask) * self.camera_res_y
+            fn = ((1-predictions) * target_mask).sum().item() / N
+        else:
+            N = x_end * self.camera_res_y
+            fn = ((1-predictions[:x_end]) * target_mask[x_end]).sum().item() / N
+
+        return fn
+
 
     def _accumulate_on_centre_spikes(self, on_centre_events):
         """
@@ -561,30 +758,6 @@ class EventToSalienceMap:
 
         return spike_mask
 
-    def _n_correct_spikes_in_frame(self, target_mask, prediction, x_start):
-        """
-        While the target-maks contains the spikes of all/multiple frames,
-         this will only count the correct spikes within this frame
-
-        Parameters:
-            target_mask (torch.Tensor): Contains spikes of multiple/all frames.
-            prediction (torch.Tensor): Contains the prediction for this frame
-            x_start: Starting point of frame to be returned.
-
-        Returns:
-             n_correct (int): The number of correct prediction with respect to the target-mask
-        """
-        x_end = x_start + self.camera_res_x
-        n_correct = 0
-
-        if x_end > len(target_mask):
-            split_idx = len(target_mask) - x_start
-            n_correct += (prediction.squeeze()[x_start:].bool() == target_mask[x_start:].bool()).sum().item()
-            n_correct += (prediction.squeeze()[:x_end % len(target_mask)].bool() == target_mask[:x_end % len(target_mask)].bool()).sum().item()
-        else:
-            n_correct += (prediction.squeeze()[x_start:x_end].bool() == target_mask[x_start:x_end].bool()).sum().item()
-
-        return n_correct
 
     def save_training_history(self, train_loss, val_loss, train_accuracy, val_accuracy, save_dir="training_logs"):
         import os
@@ -707,10 +880,12 @@ class EventToSalienceMap:
                 weight_false_pos * false_positive_penalty.sum() / n_spikes_in_frame +  # penalize incorrect spikes
                 weight_sparsity * sparsity_penalty  # encourage sparse activity
         )
+        """
         print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / n_spikes_in_frame)
         print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / n_spikes_in_frame)
         print("spartity:" ,sparsity_penalty.item(), weight_sparsity * sparsity_penalty.item())
         print("loss:", total_loss)
+        """
         return total_loss
 
     def _calculate_loss_tempo_aligned(self, predictions, targets):
@@ -746,10 +921,12 @@ class EventToSalienceMap:
                 weight_false_pos * false_positive_penalty.sum() / torch.sum(targets) +  # penalize incorrect spikes
                 weight_sparsity * sparsity_penalty  # encourage sparse activity
         )
+        """
         print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / targets.sum().item())
         print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / targets.sum().item())
         print("spartity:" ,sparsity_penalty.item(), weight_sparsity * sparsity_penalty.item())
         print("loss:", total_loss)
+        """
         return total_loss
 
     def _plot_training_history(self, train_loss_history, val_loss_history, train_acc_history, val_acc_history):
