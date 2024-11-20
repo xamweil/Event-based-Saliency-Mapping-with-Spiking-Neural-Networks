@@ -59,7 +59,7 @@ class ModelValidationEdge:
 
             validation["base_acc"].append((target_spike_mask==off_centre_mask).sum().item()/N)
 
-            validation["base_false_pos"].append((off_centre_mask*(1-target_spike_mask))/N)
+            validation["base_false_pos"].append((off_centre_mask*(1-target_spike_mask)).sum().item()/N)
 
             validation["base_false_neg"].append(((1-off_centre_mask) * target_spike_mask).sum().item()/N)
 
@@ -90,7 +90,6 @@ class ModelValidationEdge:
                       "base_false_neg": [], "n_spiking": []}
         pbar = tqdm.tqdm(scenes, desc="frame=-/480, Scenes")
         with torch.no_grad():
-
             for scene in pbar:
                 pbar.set_description("frame=-/480, Scenes")
                 # Load scenes
@@ -113,30 +112,29 @@ class ModelValidationEdge:
 
                     scene_val["base_acc"].append((on_spikes== off_spikes).sum().item() / N)
 
-                    scene_val["base_false_pos"].append((off_spikes * (1 - on_spikes)) / N)
+                    scene_val["base_false_pos"].append((off_spikes * (1 - on_spikes)).sum().item() / N)
 
                     scene_val["base_false_neg"].append(((1 - off_spikes) * on_spikes).sum().item() / N)
 
-                    scene_val["n_spiking"].append([prediction/N, on_spikes/N])
+                    scene_val["n_spiking"].append([prediction.sum().item()/N, on_spikes.sum().item()/N])
 
                     torch.cuda.empty_cache()
                     frame +=1
 
-            validation["name"].append(scene)
 
-            validation["accuracy"].append(scene_val["accuracy"])
+                validation["accuracy"].append(scene_val["accuracy"])
 
-            validation["false_pos"].append(scene_val["false_pos"])
+                validation["false_pos"].append(scene_val["false_pos"])
 
-            validation["false_neg"].append(scene_val["false_neg"])
+                validation["false_neg"].append(scene_val["false_neg"])
 
-            validation["base_acc"].append(scene_val["base_acc"])
+                validation["base_acc"].append(scene_val["base_acc"])
 
-            validation["base_false_pos"].append(scene_val["base_false_pos"])
+                validation["base_false_pos"].append(scene_val["base_false_pos"])
 
-            validation["base_false_neg"].append(scene_val["base_false_neg"])
+                validation["base_false_neg"].append(scene_val["base_false_neg"])
 
-            validation["n_spiking"].append(scene_val["n_spiking"])
+                validation["n_spiking"].append(scene_val["n_spiking"])
         return validation
 
 
@@ -147,7 +145,7 @@ class ModelValidationEdge:
         Creates a binary spike mask indicating whether each neuron spikes at least once.
 
         Parameters:
-            events (torch.Tensor): Event data for .
+            events (torch.Tensor): Event data to create mask from.
 
         Returns:
             torch.Tensor: Binary spike mask (1 if neuron spikes at least once, 0 otherwise).
@@ -194,14 +192,14 @@ class ModelValidationEdge:
         """
         path = os.path.join(dir, name+".pkl")
         with open(path, "wb") as f:
-            pickle.dump(data)
+            pickle.dump(data, f)
 
 
 if __name__ == "__main__":
-    model_path = r"C:\Users\maxeb\Documents\Radboud\Master\Master Thesis\SNNsalienceMaps\models\v0_TA"
-    model_name = "Temp_aligned_model.pth"
-    scene_file = "temp_aligned_test_list.txt"
-    data_dir = r"D:\MasterThesisDataSet"
+    model_path = r"Path/To/modelFolder"
+    model_name = "ModelName.pth"
+    scene_file = "TestSceneFile"
+    data_dir = r"Path/to/dataset"
 
     event = ets()
 
@@ -222,5 +220,5 @@ if __name__ == "__main__":
     mv.save_validation(model_path, "MaskValidation", mask_validation)
 
     Temp_aligned_validation = mv.temp_aligned_validation(scenes, data_dir)
-    mv.save_validation(model_path, "TemporalAlignedValidation")
+    mv.save_validation(model_path, "TemporalAlignedValidation", Temp_aligned_validation)
 
