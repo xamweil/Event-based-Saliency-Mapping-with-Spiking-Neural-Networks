@@ -5,11 +5,11 @@ import snntorch as snn
 from snntorch import surrogate
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 import time
 import os
-
+import pickle
+from PlotTrainingsProgress import PlotTrainingsProgress
 
 class EventToSalienceMap:
     def __init__(self, CAMERA_RES_X = 1280 , CAMERA_RES_Y = 720, LAYER1_N_NEURONS_X = 11130, device=None):
@@ -22,7 +22,8 @@ class EventToSalienceMap:
             Attributes:
                 self.device (torch.device): Device to use, either 'cuda' (GPU) or 'cpu'.
                 self.input_data (np.ndarray): Input data corresponding to the first layer.
-                self.l1_lif (snn.Leaky): First layer of Leaky Integrate and Fire (LIF) neurons.
+                self.lif_train_output_layer (snn.Leaky): Layer to generate trainings date of Leaky Integrate and Fire (LIF) neurons.
+                self.lif_input_layer (snn.Leaky): First layer of Leaky Integrate and Fire (LIF) neurons.
                 self.mem1 (None): Membrane potential for the first layer of neurons.
                 self.spk_track (list): List to store spike activity at each timestep.
             """
@@ -34,10 +35,18 @@ class EventToSalienceMap:
         #initialize torch with cuda
         self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        #init input and layer1
+        #init input and trainings layer
         self.input_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
-        self.l1_lif = snn.Leaky(beta = 0.9).to(self.device) # Is the overall input layer and the off-centre edge map
-        self.mem1 = None #torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device) #stores membrane potentials of layer1
+        self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
+        self.lif_input_layer = snn.Leaky(beta = 0.1, threshold=0.5, reset_mechanism="subtract").to(self.device) # Is the overall input layer and the off-centre edge map
+        self.lif_train_output_layer = snn.Leaky(beta=0.9, threshold=1, reset_mechanism="subtract").to(self.device)
+        # Two membrane potentials to be able to call update function in parallel for training.
+        self.mem_on = None         # stores
+        self.mem_off = None      # Stores membrane potentials of input layer
+
+        # input resets for different training modes:
+        self.input_data_reset = True
+        self.train_output_data_reset = False
 
 
     def get_angle_for_4s_sweep(self, t_min):
@@ -82,39 +91,96 @@ class EventToSalienceMap:
              - Updates `self.input_data` with the new input.
              - Automatically feeds `self.input_data` to the first layer.
          """
-        x_end = x_start+self.camera_res_x
+        x_end = x_start + self.camera_res_x
 
-        if x_end > len(self.input_data):
-            split_idx = len(self.input_data) -x_start
-            self.input_data[x_start:] = data[:split_idx]
-            self.input_data[:x_end % len(self.input_data)] = data[split_idx]
+        # Reverse the mapping direction
+        reverse_x_start = len(self.input_data) - x_start
+        reverse_x_end = reverse_x_start - self.camera_res_x
+
+        if reverse_x_end < 0:
+            split_idx = abs(reverse_x_end)
+            self.input_data[reverse_x_end:] = data[:split_idx]
+            self.input_data[:reverse_x_start] = data[split_idx:]
         else:
-            self.input_data[x_start:x_end] = data
+            self.input_data[reverse_x_end:reverse_x_start] = data
 
         # After updating input_data, automatically feed it into the first layer
         spk = self.feed_input_to_layer()
+        if self.input_data_reset:
+            self.input_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
         return spk
 
 
     def feed_input_to_layer(self):
         """
-            Feeds the updated input data to the first layer of LIF neurons and stores the spiking activity.
-            Side effects:
-                - Updates the membrane potential `self.mem` for the first layer of neurons.
-                - Appends the spiking activity `spk` to `self.spk_track`.
-            Returns:
-                spk (torch.Tensor): The spiking activity of the first layer of neurons.
-            """
+        Feeds the updated input data to the first layer of LIF neurons and stores the spiking activity.
+        Side effects:
+            - Updates the membrane potential for the specified layer (`mem_off` or `mem_on`).
+        Returns:
+            spk (torch.Tensor): The spiking activity of the specified layer of neurons.
+        """
+        # check what membrane potential is passed
 
         # Initialize the membrane potential if it's None
-        if self.mem1 is None:
-            self.mem1 = torch.zeros_like(self.input_data, device=self.device)
+        if self.mem_off is None:
+            self.mem_off = torch.zeros_like(self.input_data, device=self.device)
 
-        spk, self.mem1 = self.l1_lif(self.input_data, self.mem1)
+        spk, self.mem_off = self.lif_input_layer(self.input_data, self.mem_off)
 
         return spk
 
+    def update_train_output(self, data, x_start):
+        """
+         Updates the input tensor that represents the input to the first layer of neurons. The update only affects
+         the field of view (FOV) corresponding to the current angle and automatically feeds the updated input
+         to the first layer of LIF neurons.
 
+         Parameters:
+             data (torch.Tensor): The current input matrix (excitatory/inhibitory data).
+             x_start (int): The starting x-coordinate where the input should be updated in the first layer.
+
+         Side effects:
+             - Updates `self.input_data` with the new input.
+             - Automatically feeds `self.input_data` to the first layer.
+         """
+        x_end = x_start + self.camera_res_x
+
+        # Reverse the mapping direction
+        reverse_x_start = len(self.input_data) - x_start
+        reverse_x_end = reverse_x_start - self.camera_res_x
+
+        if reverse_x_end < 0:
+            split_idx = abs(reverse_x_end)
+            self.train_output_data[reverse_x_end:] = data[:split_idx]
+            self.train_output_data[:reverse_x_start] = data[split_idx:]
+        else:
+            self.train_output_data[reverse_x_end:reverse_x_start] = data
+
+        # After updating input_data, automatically feed it into the first layer
+        spk = self.feed_train_output_to_layer()
+
+        if self.train_output_data_reset:
+            self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
+        return spk
+
+    def feed_train_output_to_layer(self):
+        """
+        Feeds the updated input data to the first layer of LIF neurons and stores the spiking activity.
+        Side effects:
+            - Updates the membrane potential for the specified layer (`mem_off` or `mem_on`).
+        Returns:
+            spk (torch.Tensor): The spiking activity of the specified layer of neurons.
+        """
+        # check what membrane potential is passed
+
+        # Initialize the membrane potential if it's None
+        if self.mem_on is None:
+            self.mem_on = torch.zeros_like(self.input_data, device=self.device)
+
+        spk, self.mem_on = self.lif_train_output_layer(self.train_output_data, self.mem_on)
+
+
+        return spk
 
     def update_events_step_by_step(self, events, dt=4 / 480, get_angle=None):
         """
@@ -139,7 +205,7 @@ class EventToSalienceMap:
         # Get the last timestamp
         t_end = events[:, 2].max().item()
 
-        while t_min < t_end:
+        while t_min < t_end-dt:
             # Filter events based on timestamp for the current time window
             mask = (events[:, 2] >= t_min) & (events[:, 2] < t_max)
             filtered_events = events[mask]  # Filter events in the current time window
@@ -168,6 +234,59 @@ class EventToSalienceMap:
 
             # Yield the spikes generated in this timestep
             yield spikes, x_start
+
+    def update_train_events_step_by_step(self, events, dt=4 / 480, get_angle=None):
+        """
+                Updates the trainings output layer step by step with event data over time.
+
+                Parameters:
+                    events (torch.Tensor): Preloaded tensor of events (x, y, timestamp, polarity).
+                    dt (float): The time interval (in seconds) for each time window. Default is set to `4/480` seconds.
+                    get_angle (callable, optional): A function that returns the angle for the corresponding time window.
+                                                    If None, defaults to `get_angle_for_4s_sweep`.
+
+                Returns:
+                    generator: Yields spikes at each timestep.
+                """
+        if get_angle is None:
+            get_angle = self.get_angle_for_4s_sweep  # Default angle method
+
+        t_min, t_max = 0, dt
+
+        data = torch.zeros((self.camera_res_x, self.camera_res_y), device=self.device)
+
+        # Get the last timestamp
+        t_end = events[:, 2].max().item()
+
+        while t_min < t_end - dt:
+            # Filter events based on timestamp for the current time window
+            mask = (events[:, 2] >= t_min) & (events[:, 2] < t_max)
+            filtered_events = events[mask]  # Filter events in the current time window
+
+            # Write filtered events into the data tensor
+            x_coords = filtered_events[:, 0].long()  # X coordinates
+            y_coords = filtered_events[:, 1].long()  # Y coordinates
+            polarities = filtered_events[:, 3]  # Polarity values (-1 or 1)
+
+            # Apply filtered events into the input data tensor
+            data[x_coords, y_coords] = polarities
+
+            # Get angle and calculate x_start
+            angle = get_angle(t_min)
+            x_start = int((self.layer1_n_neurons_x / 360) * angle)
+
+            # Update input and yield the spike output
+            spikes = self.update_train_output(data, x_start)
+
+            # Reset data tensor for the next time window
+            data.fill_(0)
+
+            # Increment the time window
+            t_min = t_max
+            t_max += dt
+
+            # Yield the spikes generated in this timestep
+            yield spikes, x_start
     def build_convolutional_snn_for_on_centre(self):
         """
         Builds a convolutional SNN to generate the on-centre edge map from the off-centre spike input.
@@ -185,7 +304,7 @@ class EventToSalienceMap:
                 self.conv2 = torch.nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
                 self.lif2 = snn.Leaky(beta=0.9, threshold=0.5, spike_grad=surrogate.fast_sigmoid(slope=25))
                 self.conv3 = torch.nn.Conv2d(32, 1, kernel_size=3, stride=1, padding=1)
-                self.lif3 = snn.Leaky(beta=0.9, threshold=0.3, spike_grad=surrogate.fast_sigmoid(slope=25))
+                self.lif3 = snn.Leaky(beta=0.9, threshold=0.3, spike_grad=surrogate.fast_sigmoid(slope=25), learn_beta=True, learn_threshold=True)
                 # Membrane potentials for the LIF neurons
                 self.mem1 = None
                 self.mem2 = None
@@ -235,33 +354,81 @@ class EventToSalienceMap:
                 self.mem2 = None
                 self.mem3 = None
 
+            def detach_states(self):
+                """Detaches all membrane potentials from the computation graph."""
+                if self.mem1 is not None:
+                    self.mem1 = self.mem1.detach()
+                if self.mem2 is not None:
+                    self.mem2 = self.mem2.detach()
+                if self.mem3 is not None:
+                    self.mem3 = self.mem3.detach()
+
         # Instantiate the model and move it to the appropriate device
         model = ConvSNNOnCentre().to(self.device)
         return model
-
-    def train_on_centre_SNN_tempo_aligned(self, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=10,
-                            early_stopping=False, patience=5, learning_rate=1e-3, plot_training=True, device_ids=None):
+    def train_on_centre_SNN_mask(self, data_dir, ignore_file, mode, split_ratio=(0.7, 0.15, 0.15), epochs=10,
+                                          early_stopping=False, patience=5, learning_rate=1e-3,
+                                          device_ids=None, plot_progress = True,
+                                          model_dir = r"C:\Users\maxeb\Documents\Radboud\Master\Master Thesis\SNNsalienceMaps\models\VX_"):
         """
-        Trains the convolutional SNN for generating on-centre edge maps.
+        Trains a convolutional spiking neural network (SNN) for generating on-centre edge maps using a mask-based
+        training approach. Supports training, validation, and testing across multiple scenes while managing membrane
+        potentials and tracking training statistics.
 
         Parameters:
-            data_dir (str): Path to the dataset directory (where the scene folders are stored).
-            ignore_file (str): Path to the 'ignore.txt' file containing scene folders to ignore.
-            split_ratio (tuple): Ratio for splitting the dataset into train, validation, and test sets. Default is (0.7, 0.15, 0.15).
-            epochs (int): Maximum number of epochs to train. Default is 20.
-            early_stopping (bool): If True, enables early stopping based on validation loss. Default is False.
-            patience (int): Patience for early stopping (only applies if early_stopping=True). Default is 5.
-            learning_rate (float): Learning rate for the Adam optimizer. Default is 1e-3.
-            plot_training (bool): If True, saves a plot of the training and validation loss/accuracy. Default is True.
+
+            data_dir (str):
+                Path to the dataset directory (where the scene folders are stored).
+            ignore_file (str):
+                Path to the 'ignore.txt' file containing scene folders to ignore during training.
+            mode (str):
+                Training mode, either "InputMask" or "MembraneMask". Determines the configuration of the SNN layers:
+                - "InputMask": Uses membrane potential resetting in the input layer.
+                - "MembraneMask": Preserves membrane potentials across frames in the input layer.
+            split_ratio (tuple):
+                Ratio for splitting the dataset into training, validation, and test sets. Default is (0.7, 0.15, 0.15).
+            epochs (int):
+                Maximum number of epochs to train. Default is 10.
+            early_stopping (bool):
+                If True, stops training early based on validation loss. Default is False.
+            patience (int):
+                Patience for early stopping (only applies if early_stopping=True). Default is 5.
+            learning_rate (float):
+                Learning rate for the Adam optimizer. Default is 1e-3.
+            device_ids (list or None):
+                List of device IDs for multi-GPU training using `torch.nn.DataParallel`. If None, training occurs on the
+                initialized device. Default is None.
+            plot_progress (bool):
+                If True, saves training progress plots (e.g., loss, true positives) for each epoch and scene. Default is True.
+            model_dir (str):
+                Path to the directory where trained models, plots, and logs will be saved. Default is a predefined directory.
+
+        Returns:
+            None
         """
-        # Load Dataset and Split into Train/Validation/Test
-        print("Loading dataset paths...")
-        #torch.autograd.set_detect_anomaly(True)
+        if plot_progress:
+            ptp = PlotTrainingsProgress()
+
+        if mode == "InputMask":
+            self.lif_input_layer = snn.Leaky(beta = 0.1, threshold=0.5, reset_mechanism="subtract").to(self.device)
+            self.lif_train_output_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(self.device)
+            self.input_data_reset = False
+            self.train_output_data_reset = False
+            reset_mem = True
+        elif mode == "MembraneMaks":
+            self.lif_input_layer = snn.Leaky(beta=1, threshold=0.5, reset_mechanism="none").to(self.device)
+            self.lif_train_output_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(self.device)
+            self.input_data_reset = True
+            self.train_output_data_reset = False
+            reset_mem = False
+        else:
+            print("No valid mode. Valid training modes are 'InputMask' and 'MembraneMask' " )
+            return []
+
+
 
         train_scenes, val_scenes, test_scenes = self._split_dataset(data_dir, ignore_file, split_ratio)
-
-        # Save the scene lists to text files
-        self.save_scene_lists(train_scenes, val_scenes, test_scenes, "temp_aligned_")
+        self.save_scene_lists(train_scenes, val_scenes, test_scenes, os.path.join(model_dir, "{}_".format(mode)))
 
         # Initialize the SNN model and optimizer
         model = self.build_convolutional_snn_for_on_centre()
@@ -269,377 +436,634 @@ class EventToSalienceMap:
             model = torch.nn.DataParallel(model, device_ids=device_ids)
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-
         # Loss and performance tracking
         best_val_loss = float('inf')
         patience_counter = 0
-        train_loss_history, val_loss_history = [], []
-        train_accuracy_history, val_accuracy_history = [], []
-
-        # Training Loop
-
-        for epoch in range(epochs):
-            pbar = tqdm(train_scenes, total=len(train_scenes),
-                        desc="Training: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
-            model.train()  # Set model to training mode
-            train_loss, train_correct, total_train = 0, 0, 0
-
-            # Process training data one scene at a time
-
-            for scene in pbar:
-                pbar.set_description("Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch,
-                                                                                       sc=scene, fr="-"))
-                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-
-                frame=0
-                reset_mem=True
-                for (off_spikes, x_start), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
-                                                           self.update_events_step_by_step(on_centre_spikes)):
-
-
-                    optimizer.zero_grad()
-                    model.reset_state()
-
-                    # Forward pass
-                    predictions = model(off_spikes.unsqueeze(0).unsqueeze(0), reset_mem=reset_mem)  # Add batch and channel dimensions
-                    reset_mem=True #reset membrane potentials for every frame
-                    # Compare predictions against the spike mask (not individual frames)
-                    loss = self._calculate_loss_tempo_aligned(predictions.squeeze(), on_spikes)
-
-                    # Update progress Bar
-                    pbar.set_description("Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc=round((on_spikes == predictions.squeeze()).sum().item() / (self.layer1_n_neurons_x*self.layer1_n_neurons_y), 4),
-                            acc_fr = round(self._get_accuracy_in_frame(predictions.squeeze(), on_spikes, x_start), 4),
-                            fp=(predictions.squeeze() * (1 - on_spikes)).sum().item(),
-                            fn=((1 - predictions.squeeze()) * on_spikes).sum().item(),
-                            l=round(loss.item(),4), ep=epoch, sc=scene,
-                            fr = frame
-                            ))
-
-                    # Backward pass and optimize
-                    loss.backward()
-                    optimizer.step()
-                    torch.cuda.empty_cache()
-
-                    # Accumulate metrics
-                    train_loss += loss.item()
-                    total_train += on_spikes.numel()
-                    # Correct spikes (reward)
-                    train_correct += (predictions.squeeze().bool() == on_spikes.bool()).sum().item()
-
-                    frame+=1
-            torch.cuda.empty_cache()
-            # Average training loss and accuracy
-            avg_train_loss = train_loss / len(train_scenes)
-            train_accuracy = train_correct / total_train
-            train_loss_history.append(avg_train_loss)
-            train_accuracy_history.append(train_accuracy)
-
-            print(f"\r\n - Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}", end="\n")
-            #save model for
-            torch.save(model.state_dict(), "{}_epoch_Temp_alligned_model.pth".format(epoch))
-            # Step 4: Validation
-            model.eval()  # Set model to evaluation mode
-            val_loss, val_correct, total_val = 0, 0, 0
-            with torch.no_grad():
-                pbar = tqdm(val_scenes, total=len(val_scenes),
-                            desc="Validation: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
-                for scene in pbar:
-                    pbar.set_description("Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                                        acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
-                    off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-
-                    frame = 0
-                    for (off_spikes, x_start), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
-                                                               self.update_events_step_by_step(on_centre_spikes)):
-                        predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
-                        loss = self._calculate_loss_tempo_aligned(predictions, on_spikes)
-
-                        # Update progress Bar
-                        pbar.set_description("Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc=round((on_spikes == predictions.squeeze()).sum().item() / (self.layer1_n_neurons_x*self.layer1_n_neurons_y), 4),
-                            acc_fr = round(self._get_accuracy_in_frame(predictions.squeeze(), on_spikes, x_start), 4),
-                            fp=(predictions.squeeze() * (1 - on_spikes)).sum().item(),
-                            fn=((1 - predictions.squeeze()) * on_spikes).sum().item(),
-                            l=round(loss.item(),4), ep=epoch, sc=scene,
-                            fr = frame))
-
-                        # Accumulate metrics
-                        val_loss += loss.item()
-                        total_val += on_spikes.numel()
-                        val_correct += (predictions.squeeze().bool() == on_spikes.bool()).sum().item()
-                        frame +=1
-
-            # Average validation loss and accuracy
-            avg_val_loss = val_loss / len(val_scenes)
-            val_accuracy = val_correct / total_val
-            val_loss_history.append(avg_val_loss)
-            val_accuracy_history.append(val_accuracy)
-
-            print(f"\r\n- Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}", end="\n")
-
-            # Early stopping logic
-            if early_stopping:
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    patience_counter = 0  # Reset patience counter
-                    torch.save(model.state_dict(), "best_model.pth")  # Save the best model
-                else:
-                    patience_counter += 1
-
-                if patience_counter >= patience:
-                    print("Early stopping triggered.")
-                    break
-
-        torch.save(model.state_dict(), "Temp_aligned_model.pth")
-        torch.cuda.empty_cache()
-        # Step 5: Testing
-        print("Testing model on test set...")
-        model.load_state_dict(torch.load("Temp_aligned_model.pth"))  # Load best model
-        test_loss, test_correct, total_test = 0, 0, 0
-        model.eval()
-        with torch.no_grad():
-            for scene in test_scenes:
-                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
-                for (off_spikes, _), (on_spikes, _) in zip(self.update_events_step_by_step(off_centre_spikes),
-                                                 self.update_events_step_by_step(on_centre_spikes)):
-                    predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
-                    loss = self._calculate_loss_tempo_aligned(predictions, on_spikes)
-
-                    # Accumulate metrics
-                    test_loss += loss.item()
-                    total_test += on_spikes.numel()
-                    test_correct += (predictions.squeeze().bool() == on_spikes.bool()).sum().item()
-
-        avg_test_loss = test_loss / len(test_scenes)
-        test_accuracy = test_correct / total_test
-        print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}")
-
-        self.save_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history,
-                                   save_dir="temp_aligned_training_logs")
-
-        # Step 6: Plot Training History
-        if plot_training:
-            self._plot_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history)
-    def train_on_centre_SNN_tempo_independent(self, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=10,
-                            early_stopping=False, patience=5, learning_rate=1e-3, plot_training=True, device_ids=None):
-        """
-        Trains the convolutional SNN for generating on-centre edge maps. The training is temporal independent. A spike mask
-        is created that contains the spikes of all frames of the training scene, while the input remains frame by frame.
-
-        Parameters:
-            data_dir (str): Path to the dataset directory (where the scene folders are stored).
-            ignore_file (str): Path to the 'ignore.txt' file containing scene folders to ignore.
-            split_ratio (tuple): Ratio for splitting the dataset into train, validation, and test sets. Default is (0.7, 0.15, 0.15).
-            epochs (int): Maximum number of epochs to train. Default is 20.
-            early_stopping (bool): If True, enables early stopping based on validation loss. Default is False.
-            patience (int): Patience for early stopping (only applies if early_stopping=True). Default is 5.
-            learning_rate (float): Learning rate for the Adam optimizer. Default is 1e-3.
-            plot_training (bool): If True, saves a plot of the training and validation loss/accuracy. Default is True.
-            device_ids (tulple): Contains devices to train on, if None trains on initialized device. Default is None
-        """
-        # Load Dataset and Split into Train/Validation/Test
-        print("Loading dataset paths...")
-        #torch.autograd.set_detect_anomaly(True)
-
-        train_scenes, val_scenes, test_scenes = self._split_dataset(data_dir, ignore_file, split_ratio)
-
-        self.save_scene_lists(train_scenes, val_scenes, test_scenes, "temp_independent_")
-
-        # Initialize the SNN model and optimizer
-        model = self.build_convolutional_snn_for_on_centre()
-        if device_ids:
-            model = torch.nn.DataParallel(model, device_ids=device_ids)
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-
-        # Loss and performance tracking
-        best_val_loss = float('inf')
-        patience_counter = 0
-        train_loss_history, val_loss_history = [], []
-        train_accuracy_history, val_accuracy_history = [], []
+        train_history = []
+        val_history = []
 
         # Training Loop
         for epoch in range(epochs):
             pbar = tqdm(train_scenes, total=len(train_scenes),
-                        desc="Training: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
+                        desc="Training: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
             model.train()  # Set model to training mode
-            train_loss, train_correct, total_train = 0, 0, 0
+            train_stats = {"loss": [], "tp": [], "fp": [], "fn": [], "n_spk": []}
+            validation_stats = {"loss": [], "tp": [], "fp": [], "fn": [], "n_spk": []}
+
 
             # Process training data one scene at a time
+
             for scene in pbar:
+                if plot_progress:
+                    ptp.update_scene("Training", scene)
                 pbar.set_description(
-                    "Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                        acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
-                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                    "Training: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                        tp="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
 
-                #  Accumulate spikes for the on-centre data (binary mask)
-                spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
-                reset_mem=True
-                frame=0
-                for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
+                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                train_ls, train_tp, train_fp, train_fn, train_n_spk = [], [], [], [], []
+
+                # Reset membrane potentials and inputs
+                self.mem_on = None
+                self.mem_off = None
+                model.reset_state()
+                self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
+                self.input_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
+                for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(zip(self.update_events_step_by_step(off_centre_spikes),
+                                                                              self.update_train_events_step_by_step(on_centre_spikes))):
+                    x_start = int(self.layer1_n_neurons_x - x_start)
 
                     optimizer.zero_grad()
-                    model.reset_state()
 
-                    # Forward pass
+
+                    # Forward pass without membrane potential reset
                     predictions = model(off_spikes.unsqueeze(0).unsqueeze(0), reset_mem=reset_mem)  # Add batch and channel dimensions
-                    reset_mem=False # Membrane potential is carried on (No reset).
-                    # Compare predictions against the spike mask (not individual frames)
-                    loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
+
+
+                    loss = self.loss_function_mask_training(predictions.squeeze(), on_spikes, x_start)
 
                     # Update progress Bar
+                    tp = self._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
+                    fp = self.get_fp_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+                    fn = self.get_fn_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+
                     pbar.set_description(
-                        "Training: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc=round(self._get_accuracy_mask_training(predictions.squeeze(), spike_mask, x_start), 4),
-                            acc_fr=round(self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start), 4),
-                            fp=self._get_false_positive_mask_training(predictions.squeeze(), spike_mask, x_start),
-                            fn=self._get_false_negative_mask_training(predictions.squeeze(), spike_mask, x_start),
-                            l=round(loss.item(), 4), ep=epoch, sc=scene, fr=frame
+                        "Training: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp=round(tp, 4),
+                            fp=round(fp, 4),
+                            fn=round(fn, 4),
+                            l=round(loss.item(), 4), ep=epoch, sc=scene,
+                            fr=frame
                         ))
 
                     # Backward pass and optimize
                     loss.backward()
                     optimizer.step()
+
+                    # detach membrane potentials from computational graph
+                    model.detach_states()
+                    # append statistics
+                    train_ls.append(loss.item())
+                    train_tp.append(tp)
+                    train_fp.append(fp)
+                    train_fn.append(fn)
+                    train_n_spk.append([predictions.squeeze().sum().item(), on_spikes.sum().item()])
+                    if plot_progress:
+                        ptp.update_plot(off_spikes, predictions.squeeze(), on_spikes, train_tp, train_fp, train_fn, os.path.join(model_dir, "TrainingPlots"), scene +"ep_{}".format(epoch))
+                    # empty cache
                     torch.cuda.empty_cache()
+                # save training statistics per scene
+                train_stats["loss"].append(train_ls)
+                train_stats["tp"].append(train_tp)
+                train_stats["fp"].append(train_fp)
+                train_stats["fn"].append(train_fn)
+                train_stats["n_spk"].append(train_n_spk)
+                # clear memory
+                train_ls.clear()
+                train_tp.clear()
+                train_fp.clear()
+                train_fn.clear()
+                train_n_spk.clear()
 
-                    # Accumulate metrics
-                    train_loss += loss.item()
-                    total_train += self.camera_res_x*self.camera_res_y
-                    # Correct spikes (reward)
-                    train_correct += self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start)
-                    frame+=1
-
-            torch.cuda.empty_cache()
-            # Average training loss and accuracy
-            avg_train_loss = train_loss / len(train_scenes)
-            train_accuracy = train_correct / total_train
-            train_loss_history.append(avg_train_loss)
-            train_accuracy_history.append(train_accuracy)
-
-
-            print(f"\r\n - Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}", end="\n")
-            # save model for
-            torch.save(model.state_dict(), "{}_epoch_Temp_indep_model.pth".format(epoch))
-
-            # Step 4: Validation
-            model.eval()  # Set model to evaluation mode
-            val_loss, val_correct, total_val = 0, 0, 0
+            #Validation
+            model.eval()
             with torch.no_grad():
                 pbar = tqdm(val_scenes, total=len(val_scenes),
-                            desc="Validation: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                                acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
+                            desc="Validation: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                                tp="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
                 for scene in pbar:
-                    pbar.set_description("Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
+                    pbar.set_description(
+                        "Validation: tp={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
+                    if plot_progress:
+                        ptp.update_scene("Validation", scene)
 
-                    # Load scene data
+
                     off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                    val_ls, val_tp, val_fp, val_fn, val_n_spk = [], [], [], [], []
 
-                    # Generate spike mask
-                    spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
-                    frame = 0
+                    # Reset input layer membrane potential
+                    self.mem_on = None
+                    self.mem_off = None
+                    self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y),
+                                                         device=self.device)
+                    self.input_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y),
+                                                  device=self.device)
+                    for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(
+                            zip(self.update_events_step_by_step(off_centre_spikes),
+                                self.update_train_events_step_by_step(on_centre_spikes))):
 
-                    for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
+                        x_start = int(self.layer1_n_neurons_x - x_start)
 
-                        predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
-                        loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
+                        # Forward pass without membrane potential reset
+                        predictions = model(off_spikes.unsqueeze(0).unsqueeze(0),
+                                            reset_mem=reset_mem)  # Add batch and channel dimensions
+
+
+                        loss = self.loss_function_mask_training(predictions.squeeze(), on_spikes, x_start)
 
                         # Update progress Bar
+                        tp = self._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
+                        fp = self.get_fp_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+                        fn = self.get_fn_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+
                         pbar.set_description(
-                            "Validation: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                                acc=round(self._get_accuracy_mask_training(predictions.squeeze(), spike_mask, x_start),
-                                          4),
-                                acc_fr=round(self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start),
-                                             4),
-                                fp=self._get_false_positive_mask_training(predictions.squeeze(), spike_mask, x_start),
-                                fn=self._get_false_negative_mask_training(predictions.squeeze(), spike_mask, x_start),
-                                l=round(loss.item(), 4), ep=epoch, sc=scene, fr=frame
+                            "Validation: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                                tp=round(tp, 4),
+                                fp=round(fp, 4),
+                                fn=round(fn, 4),
+                                l=round(loss.item(), 4), ep=epoch, sc=scene,
+                                fr=frame
                             ))
+
+                        # append statistics
+                        val_ls.append(loss.item())
+                        val_tp.append(tp)
+                        val_fp.append(fp)
+                        val_fn.append(fn)
+                        val_n_spk.append([predictions.squeeze().sum().item(), on_spikes.sum().item()])
+                        if plot_progress:
+                            ptp.update_plot(off_spikes, predictions.squeeze(), on_spikes, val_tp, val_fp, val_fn,
+                                            os.path.join(model_dir, "ValidationPlots"), scene + "ep_{}".format(epoch))
+
+                        # empty cache
                         torch.cuda.empty_cache()
 
-                        # Accumulate metrics
-                        val_loss += loss.item()
-                        total_val += self.camera_res_x*self.camera_res_y
-                        train_correct += self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start)
-                        frame +=1
+                    # save validation statistics  per scene
+                    validation_stats["loss"].append(val_ls)
+                    validation_stats["tp"].append(val_tp)
+                    validation_stats["fp"].append(val_fp)
+                    validation_stats["fn"].append(val_fn)
+                    validation_stats["n_spk"].append(val_n_spk)
+                    # clear memory
+                    val_ls.clear()
+                    val_tp.clear()
+                    val_fp.clear()
+                    val_fn.clear()
+                    val_n_spk.clear()
 
-            # Average validation loss and accuracy
-            avg_val_loss = val_loss / len(val_scenes)
-            val_accuracy = val_correct / total_val
-            val_loss_history.append(avg_val_loss)
-            val_accuracy_history.append(val_accuracy)
+            train_history.append(train_stats)
+            val_history.append(validation_stats)
 
-            print(f"\r\n - Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}", end="\n")
+        torch.save(model.state_dict(), os.path.join(model_dir, "{}_model.pth".format(mode)))
 
-            # Early stopping logic
-            if early_stopping:
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    patience_counter = 0  # Reset patience counter
-                    torch.save(model.state_dict(), "best_model.pth")  # Save the best model
-                else:
-                    patience_counter += 1
-
-                if patience_counter >= patience:
-                    print("Early stopping triggered.")
-                    break
-
-        torch.save(model.state_dict(), "Temp_independent_model.pth")
         torch.cuda.empty_cache()
+
+
+
         # Testing
-        print("Testing model on test set...")
-        model.load_state_dict(torch.load("Temp_independent_model.pth"))  # Load best model
-        test_loss, test_correct, total_test = 0, 0, 0
+        model.load_state_dict(torch.load(os.path.join(model_dir, "{}_model.pth").format(mode)))
+        test_history = {"loss": [], "tp": [], "fp": [], "fn": [], "n_spk": []}
         model.eval()
         with torch.no_grad():
-            pbar = tqdm(test_scenes, total=len(test_scenes),
-                        desc="Testing: Acc={acc}, Acc_fr={acc_fr} FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
-            for scene in test_scenes:
+            pbar = tqdm(test_scenes, total=len(val_scenes),
+                        desc="Validation: tp={tp}, FP={fp}, FN={fn}, loss={l}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp="-", fp="-", fn="-", l="-", sc="-", fr="-"))
+            for scene in pbar:
                 pbar.set_description(
-                    "Testing: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                        acc="-", acc_fr="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
-                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                    "Test: tp={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                        tp="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
 
-                spike_mask = self._accumulate_on_centre_spikes(on_centre_spikes)
-                for off_spikes, x_start in self.update_events_step_by_step(off_centre_spikes):
-                    predictions = model(off_spikes.unsqueeze(0).unsqueeze(0))
-                    loss = self._calculate_loss_temp_indep(predictions.squeeze(), spike_mask, x_start)
+                if plot_progress:
+                    ptp.update_scene("Test", scene)
+                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                test_ls, test_tp, test_fp, test_fn, test_n_spk = [], [], [], [], []
+
+                # Reset input layer membrane potential
+                self.mem_on = None
+                self.mem_off = None
+                self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y),
+                                                     device=self.device)
+                for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(
+                        zip(self.update_events_step_by_step(off_centre_spikes),
+                            self.update_train_events_step_by_step(on_centre_spikes))):
+
+                    x_start = int(self.layer1_n_neurons_x - x_start)
+
+                    # Forward pass without membrane potential reset
+                    predictions = model(off_spikes.unsqueeze(0).unsqueeze(0),
+                                        reset_mem=reset_mem)  # Add batch and channel dimensions
+
+
+                    loss = self.loss_function_mask_training(predictions.squeeze(), on_spikes, x_start)
 
                     # Update progress Bar
+                    tp = self._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
+                    fp = self.get_fp_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+                    fn = self.get_fn_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+
                     pbar.set_description(
-                        "Testing: Acc={acc}, Acc_fr={acc_fr}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
-                            acc=round(self._get_accuracy_mask_training(predictions.squeeze(), spike_mask, x_start),
-                                      4),
-                            acc_fr=round(self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start),
-                                         4),
-                            fp=self._get_false_positive_mask_training(predictions.squeeze(), spike_mask, x_start),
-                            fn=self._get_false_negative_mask_training(predictions.squeeze(), spike_mask, x_start),
-                            l=round(loss.item(), 4), ep=epoch, sc=scene, fr=frame
+                        "Test: tp={tp}, FP={fp}, FN={fn}, loss={l}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp=round(tp, 4),
+                            fp=round(fp, 4),
+                            fn=round(fn, 4),
+                            l=round(loss.item(), 4), sc=scene,
+                            fr=frame
                         ))
+
+                    # append statistics
+                    test_ls.append(loss.item())
+                    test_tp.append(tp)
+                    test_fp.append(fp)
+                    test_fn.append(fn)
+                    test_n_spk.append([predictions.squeeze().sum().item(), on_spikes.sum().item()])
+
+
+                    if plot_progress:
+                        ptp.update_plot(off_spikes, predictions.squeeze(), on_spikes, test_tp, test_fp, test_fn,
+                                        os.path.join(model_dir,"TestPlots"), scene + "ep_{}".format(epoch))
+                    # empty cache
                     torch.cuda.empty_cache()
 
-                    # Accumulate metrics
-                    test_loss += loss.item()
-                    total_test += self.camera_res_x*self.camera_res_y
-                    test_correct += self._get_accuracy_in_frame(predictions.squeeze(), spike_mask, x_start)
+                # save validation statistics  per scene
+                test_history["loss"].append(test_ls)
+                test_history["tp"].append(test_tp)
+                test_history["fp"].append(test_fp)
+                test_history["fn"].append(test_fn)
+                test_history["n_spk"].append(test_n_spk)
 
-        avg_test_loss = test_loss / len(test_scenes)
-        test_accuracy = test_correct / total_test
-        print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}")
 
-        self.save_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history, save_dir="temp_indep_training_logs")
+        self.save_training_history(train_history, val_history, test_history, save_dir=os.path.join(model_dir, "training_logs"))  # shapes (epoch, dict), (epochs, dict), (dict)
 
-        # Plot Training History
-        if plot_training:
-            self._plot_training_history(train_loss_history, val_loss_history, train_accuracy_history, val_accuracy_history)
-    def _get_accuracy_in_frame(self, prediction, target, x_start):
+
+    def train_on_centre_SNN_temporal_aligned(self, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=10,
+                                          early_stopping=False, patience=5, learning_rate=1e-3,
+                                          device_ids=None, plot_progress = True):
         """
-        calculates the ratio of equal entries between two tensors.
+        Parameters:
+        data_dir (str): Path to the dataset directory (where the scene folders are stored).
+        ignore_file (str): Path to the 'ignore.txt' file containing scene folders to ignore.
+        split_ratio (tuple): Ratio for splitting the dataset into train, validation, and test sets. Default is (0.7, 0.15, 0.15).
+        epochs (int): Maximum number of epochs to train. Default is 20.
+        early_stopping (bool): If True, enables early stopping based on validation loss. Default is False.
+        patience (int): Patience for early stopping (only applies if early_stopping=True). Default is 5.
+        learning_rate (float): Learning rate for the Adam optimizer. Default is 1e-3.
+        plot_training (bool): If True, saves a plot of the training and validation loss/accuracy. Default is True.
+        device_ids (tulple): Contains devices to train on, if None trains on initialized device. Default is None
+        """
+        if plot_progress:
+            ptp = PlotTrainingsProgress()
+
+        # Training mode for temporal aligned:
+        self.lif_input_layer = snn.Leaky(beta = 0.1, threshold=0.5, reset_mechanism="subtract").to(self.device)
+        self.lif_train_output_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(self.device)
+        self.input_data_reset = True
+        self.train_output_data_reset = False
+
+
+        train_scenes, val_scenes, test_scenes = self._split_dataset(data_dir, ignore_file, split_ratio)
+        self.save_scene_lists(train_scenes, val_scenes, test_scenes, r"models\V1_TA\temp_aligned_")
+
+        # Initialize the SNN model and optimizer
+        model = self.build_convolutional_snn_for_on_centre()
+        if device_ids:
+            model = torch.nn.DataParallel(model, device_ids=device_ids)
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+        # Loss and performance tracking
+        best_val_loss = float('inf')
+        patience_counter = 0
+        train_history = []
+        val_history = []
+
+        # Training Loop
+        for epoch in range(epochs):
+            pbar = tqdm(train_scenes, total=len(train_scenes),
+                        desc="Training: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
+            model.train()  # Set model to training mode
+            train_stats = {"loss": [], "tp": [], "fp": [], "fn": [], "n_spk": []}
+            validation_stats = {"loss": [], "tp": [], "fp": [], "fn": [], "n_spk": []}
+
+
+            # Process training data one scene at a time
+
+            for scene in pbar:
+                if plot_progress:
+                    ptp.update_scene("Training", scene)
+                pbar.set_description(
+                    "Training: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                        tp="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
+
+                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                train_ls, train_tp, train_fp, train_fn, train_n_spk = [], [], [], [], []
+
+                # Reset membrane potentials
+                self.mem_on = None
+                self.mem_off = None
+                model.reset_state()
+                self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y), device=self.device)
+                for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(zip(self.update_events_step_by_step(off_centre_spikes),
+                                                                              self.update_train_events_step_by_step(on_centre_spikes))):
+                    x_start = int(self.layer1_n_neurons_x - x_start)
+
+                    optimizer.zero_grad()
+
+
+                    # Forward pass without membrane potential reset
+                    predictions = model(off_spikes.unsqueeze(0).unsqueeze(0), reset_mem=False)  # Add batch and channel dimensions
+
+
+                    loss = self.loss_function_temporal_aligned(predictions.squeeze(), on_spikes, x_start)
+                    #pre = predictions.squeeze().cpu().numpy()
+                    #on_spk = on_spikes.cpu().numpy()
+                    # Update progress Bar
+                    tp = self._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
+                    fp = self.get_fp_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+                    fn = self.get_fn_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+
+                    pbar.set_description(
+                        "Training: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp=round(tp, 4),
+                            fp=round(fp, 4),
+                            fn=round(fn, 4),
+                            l=round(loss.item(), 4), ep=epoch, sc=scene,
+                            fr=frame
+                        ))
+
+                    # Backward pass and optimize
+                    loss.backward()
+                    optimizer.step()
+
+                    # detach membrane potentials from computational graph
+                    model.detach_states()
+                    # append statistics
+                    train_ls.append(loss.item())
+                    train_tp.append(tp)
+                    train_fp.append(fp)
+                    train_fn.append(fn)
+                    train_n_spk.append([predictions.squeeze().sum().item(), on_spikes.sum().item()])
+                    if plot_progress:
+                        ptp.update_plot(off_spikes, predictions.squeeze(), on_spikes, train_tp, train_fp, train_fn, "TrainingPlots", scene +"ep_{}".format(epoch))
+                    # empty cache
+                    torch.cuda.empty_cache()
+                # save training statistics per scene
+                train_stats["loss"].append(train_ls)
+                train_stats["tp"].append(train_tp)
+                train_stats["fp"].append(train_fp)
+                train_stats["fn"].append(train_fn)
+                train_stats["n_spk"].append(train_n_spk)
+                # clear memory
+                train_ls.clear()
+                train_tp.clear()
+                train_fp.clear()
+                train_fn.clear()
+                train_n_spk.clear()
+
+            #Validation
+            model.eval()
+            with torch.no_grad():
+                pbar = tqdm(val_scenes, total=len(val_scenes),
+                            desc="Validation: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                                tp="-", fp="-", fn="-", l="-", ep=epoch, sc="-", fr="-"))
+                for scene in pbar:
+                    pbar.set_description(
+                        "Validation: tp={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
+                    if plot_progress:
+                        ptp.update_scene("Validation", scene)
+
+
+                    off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                    val_ls, val_tp, val_fp, val_fn, val_n_spk = [], [], [], [], []
+
+                    # Reset input layer membrane potential
+                    self.mem_on = None
+                    self.mem_off = None
+                    self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y),
+                                                         device=self.device)
+                    for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(
+                            zip(self.update_events_step_by_step(off_centre_spikes),
+                                self.update_train_events_step_by_step(on_centre_spikes))):
+
+                        x_start = int(self.layer1_n_neurons_x - x_start)
+
+                        # Forward pass without membrane potential reset
+                        predictions = model(off_spikes.unsqueeze(0).unsqueeze(0),
+                                            reset_mem=reset_mem)  # Add batch and channel dimensions
+                        reset_mem = False
+
+                        loss = self.loss_function_temporal_aligned(predictions.squeeze(), on_spikes, x_start)
+
+                        # Update progress Bar
+                        tp = self._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
+                        fp = self.get_fp_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+                        fn = self.get_fn_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+
+                        pbar.set_description(
+                            "Validation: TP={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                                tp=round(tp, 4),
+                                fp=round(fp, 4),
+                                fn=round(fn, 4),
+                                l=round(loss.item(), 4), ep=epoch, sc=scene,
+                                fr=frame
+                            ))
+
+                        # append statistics
+                        val_ls.append(loss.item())
+                        val_tp.append(tp)
+                        val_fp.append(fp)
+                        val_fn.append(fn)
+                        val_n_spk.append([predictions.squeeze().sum().item(), on_spikes.sum().item()])
+                        if plot_progress:
+                            ptp.update_plot(off_spikes, predictions.squeeze(), on_spikes, val_tp, val_fp, val_fn,
+                                            "ValidationPlots", scene + "ep_{}".format(epoch))
+
+                        # empty cache
+                        torch.cuda.empty_cache()
+
+                    # save validation statistics  per scene
+                    validation_stats["loss"].append(val_ls)
+                    validation_stats["tp"].append(val_tp)
+                    validation_stats["fp"].append(val_fp)
+                    validation_stats["fn"].append(val_fn)
+                    validation_stats["n_spk"].append(val_n_spk)
+                    # clear memory
+                    val_ls.clear()
+                    val_tp.clear()
+                    val_fp.clear()
+                    val_fn.clear()
+                    val_n_spk.clear()
+
+            train_history.append(train_stats)
+            val_history.append(validation_stats)
+
+        torch.save(model.state_dict(), "Temporal_aligned_model.pth")
+
+        torch.cuda.empty_cache()
+
+
+
+        # Testing
+        model.load_state_dict(torch.load("Temp_aligned_model.pth"))
+        test_history = {"loss": [], "tp": [], "fp": [], "fn": [], "n_spk": []}
+        model.eval()
+        with torch.no_grad():
+            pbar = tqdm(test_scenes, total=len(val_scenes),
+                        desc="Validation: tp={tp}, FP={fp}, FN={fn}, loss={l}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp="-", fp="-", fn="-", l="-", sc="-", fr="-"))
+            for scene in pbar:
+                pbar.set_description(
+                    "Test: tp={tp}, FP={fp}, FN={fn}, loss={l}, Epoch={ep}, scene={sc}, frame={fr}/480, scene_nr".format(
+                        tp="-", fp="-", fn="-", l="-", ep=epoch, sc=scene, fr="-"))
+
+                if plot_progress:
+                    ptp.update_scene("Test", scene)
+                off_centre_spikes, on_centre_spikes = self._load_scene_data(scene, data_dir)
+                test_ls, test_tp, test_fp, test_fn, test_n_spk = [], [], [], [], []
+
+                # Reset input layer membrane potential
+                self.mem_on = None
+                self.mem_off = None
+                self.train_output_data = torch.zeros((self.layer1_n_neurons_x, self.layer1_n_neurons_y),
+                                                     device=self.device)
+                for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(
+                        zip(self.update_events_step_by_step(off_centre_spikes),
+                            self.update_train_events_step_by_step(on_centre_spikes))):
+
+                    x_start = int(self.layer1_n_neurons_x - x_start)
+
+                    # Forward pass without membrane potential reset
+                    predictions = model(off_spikes.unsqueeze(0).unsqueeze(0),
+                                        reset_mem=reset_mem)  # Add batch and channel dimensions
+                    reset_mem = False
+
+                    loss = self.loss_function_temporal_aligned(predictions.squeeze(), on_spikes, x_start)
+
+                    # Update progress Bar
+                    tp = self._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
+                    fp = self.get_fp_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+                    fn = self.get_fn_out_of_frame(predictions.squeeze(), on_spikes, x_start)
+
+                    pbar.set_description(
+                        "Test: tp={tp}, FP={fp}, FN={fn}, loss={l}, scene={sc}, frame={fr}/480, scene_nr".format(
+                            tp=round(tp, 4),
+                            fp=round(fp, 4),
+                            fn=round(fn, 4),
+                            l=round(loss.item(), 4), sc=scene,
+                            fr=frame
+                        ))
+
+                    # append statistics
+                    test_ls.append(loss.item())
+                    test_tp.append(tp)
+                    test_fp.append(fp)
+                    test_fn.append(fn)
+                    test_n_spk.append([predictions.squeeze().sum().item(), on_spikes.sum().item()])
+
+
+                    if plot_progress:
+                        ptp.update_plot(off_spikes, predictions.squeeze(), on_spikes, test_tp, test_fp, test_fn,
+                                        "TestPlots", scene + "ep_{}".format(epoch))
+                    # empty cache
+                    torch.cuda.empty_cache()
+
+                # save validation statistics  per scene
+                test_history["loss"].append(test_ls)
+                test_history["tp"].append(test_tp)
+                test_history["fp"].append(test_fp)
+                test_history["fn"].append(test_fn)
+                test_history["n_spk"].append(test_n_spk)
+
+
+        self.save_training_history(train_history, val_history, test_history)  # shapes (epoch, dict), (epochs, dict), (dict)
+
+    def loss_function_mask_training(self, predictions, target, x_start):
+        surrogate_grad = surrogate.fast_sigmoid(slope=25)
+        sur_pred = surrogate_grad(predictions)
+
+        # false positive / false negatige penalty and true positive reward up to start of current frame
+        x_end = x_start - self.camera_res_x
+
+        if x_end < 0:
+            N_tp = target.sum()
+            N_fp = (1 - target).sum()
+            N_fn = N_tp
+            fp = (sur_pred * (1 - target)).sum()
+            fn = ((1 - sur_pred) * target).sum()
+            tp = (sur_pred * target).sum()
+        else:
+            N_tp = target[x_end:].sum()
+            N_fp = (1 - target[x_end:]).sum()
+            N_fn = N_tp
+
+            fp = (sur_pred * (1 - target)).sum()
+            fn = ((1 - sur_pred[x_end:]) * target[x_end:]).sum()
+
+            tp = (sur_pred[x_end:] * target[x_end:]).sum()
+
+        sparsity_penalty = torch.mean(sur_pred)
+
+        weight_true_pos = -1.5
+        weight_false_pos = 1
+        weight_false_neg = 0.5
+        weight_sparsity = 0.3
+        # Total loss:
+        # - Reward for true positives (maximize correct spikes),
+        # - Penalty for false positives (minimize incorrect spikes),
+        # - Sparsity penalty to avoid excessive spiking.
+        total_loss = (
+                weight_true_pos * tp / N_tp +  # reward for correct spikes
+                weight_false_pos * fp / N_fp +  # penalize incorrect spikes
+                weight_false_neg * fn / N_fn +  # penalize missing spikes
+                weight_sparsity * sparsity_penalty  # encourage sparse activity
+        )
+
+        return total_loss
+
+
+    def loss_function_temporal_aligned(self, predictions, target, x_start):
+
+        surrogate_grad = surrogate.fast_sigmoid(slope=25)
+        sur_pred = surrogate_grad(predictions)
+
+        # false positive / false negatige penalty and true positive reward up to start of current frame
+        x_end = x_start - self.camera_res_x
+
+        if x_end < 0:
+            N_tp = target.sum().item()
+            N_fp = (1-target).sum().item()
+            N_fn = N_tp
+            fp = (sur_pred * (1 - target)).sum()
+            fn = ((1 - sur_pred) * target).sum()
+            tp = (sur_pred * target).sum()
+        else:
+            N_tp = target[x_end:].sum().item()
+            N_fp = (1-target[x_end:]).sum().item()
+            N_fn = N_tp
+
+            fp = (sur_pred * (1 - target)).sum()
+            fn = ((1 - sur_pred[x_end:]) * target[x_end:]).sum()
+
+            tp = (sur_pred[x_end:] * target[x_end:]).sum()
+    
+
+        sparsity_penalty = torch.mean(sur_pred)
+    
+
+        weight_true_pos = -1.5
+        weight_false_pos = 1.5
+        weight_false_neg = 0.5
+        weight_sparsity = 0.3
+        # Total loss:
+        # - Reward for true positives (maximize correct spikes),
+        # - Penalty for false positives (minimize incorrect spikes),
+        # - Sparsity penalty to avoid excessive spiking.
+        total_loss = (
+                weight_true_pos * tp / N_tp +  # reward for correct spikes
+                weight_false_pos * fp / N_fp +  # penalize incorrect spikes
+                weight_false_neg * fn / N_fn +  # penalize missing spikes
+                weight_sparsity * sparsity_penalty  # encourage sparse activity
+        )
+
+        return total_loss
+
+
+    def _get_tp_to_frame(self, prediction, target, x_start):
+        """
+        calculates the ratio of entries that are 1 between two tensors up to the end of the current frame.
+
 
         Parameters:
             prediction (torch.Tensor): Tensor that holds the predictions
@@ -649,13 +1073,64 @@ class EventToSalienceMap:
         Return:
              Ratio of correct predictions in one frame.
         """
-        x_end = x_start+self.camera_res_x
-        if x_end > len(target):
-            acc = torch.cat((prediction[x_start:]==target[x_start:], prediction[:x_end%len(target)]==target[:x_end%len(target)]))
+        x_end = x_start - self.camera_res_x
+        if x_end > 0:
+            tp = prediction[x_end:]*target[x_end:]
+            N = target[x_end:].sum().item()
         else:
-            acc = prediction[x_start:x_end]==target[x_start:x_end]
-        return acc.sum().item()/(self.camera_res_x*self.camera_res_y)
+            tp = prediction * target
+            N = target.sum().item()
 
+        if N==0:
+            return 1
+        return tp.sum().item()/N
+    def get_fp_out_of_frame(self, prediction, target, x_start):
+        """
+        Counts the False positives in the prediction up to the end of the current frame.
+
+        Parameters:
+            prediction (torch.Tensor): Tensor that holds the predictions
+            target (torch.Tensor): Tensor that holds the targets
+            x_start (int): Holds the start position of the frame
+
+        Return:
+            ratio of false positives outside the current frame.
+        """
+        x_end = x_start - self.camera_res_x
+
+        if x_end < 0:
+            N = (1-target).sum().item()
+            fp = (prediction * (1 - target)).sum().item()
+        else:
+            N = (1 - target[x_end:]).sum().item()
+            fp = (prediction[x_end:] * (1 - target[x_end:])).sum().item()
+        if N==0:
+            return fp
+        return fp/N
+
+    def get_fn_out_of_frame(self, prediction, target, x_start):
+        """
+        Counts the False positives in the prediction up to the end of the current frame.
+
+        Parameters:
+            prediction (torch.Tensor): Tensor that holds the predictions
+            target (torch.Tensor): Tensor that holds the targets
+            x_start (int): Holds the start position of the frame
+
+        Return:
+            ratio of false positives outside the current frame.
+        """
+        x_end = x_start - self.camera_res_x
+
+        if x_end < 0:
+            N = target.sum().item()
+            fn = ((1 - prediction) * target).sum().item()
+        else:
+            N = target[x_end:].sum().item()
+            fn = ((1 - prediction[x_end:]) * target[x_end:]).sum().item()
+        if N==0:
+            return fn
+        return fn/N
     def _get_accuracy_mask_training(self, predictions, target_mask, x_start):
         """
         Calculates the accuracy from the part of the mask that already had an input, up to the current frame.
@@ -759,27 +1234,23 @@ class EventToSalienceMap:
         return spike_mask
 
 
-    def save_training_history(self, train_loss, val_loss, train_accuracy, val_accuracy, save_dir="training_logs"):
-        import os
+    def save_training_history(self, train_history, val_history, test_history, save_dir="training_logs"):
+
 
         # Ensure the directory exists
         os.makedirs(save_dir, exist_ok=True)
 
         # Save each list to a separate file
-        with open(os.path.join(save_dir, "train_loss_history.txt"), "w") as f:
-            for item in train_loss:
+        with open(os.path.join(save_dir, "train_history.txt"), "w") as f:
+            for item in train_history:
                 f.write(f"{item}\n")
 
-        with open(os.path.join(save_dir, "val_loss_history.txt"), "w") as f:
-            for item in val_loss:
+        with open(os.path.join(save_dir, "val_history.txt"), "w") as f:
+            for item in val_history:
                 f.write(f"{item}\n")
 
-        with open(os.path.join(save_dir, "train_accuracy_history.txt"), "w") as f:
-            for item in train_accuracy:
-                f.write(f"{item}\n")
-
-        with open(os.path.join(save_dir, "val_accuracy_history.txt"), "w") as f:
-            for item in val_accuracy:
+        with open(os.path.join(save_dir, "test_history.txt"), "w") as f:
+            for item in test_history:
                 f.write(f"{item}\n")
 
         print(f"Training history saved in '{save_dir}'")
@@ -839,95 +1310,24 @@ class EventToSalienceMap:
 
         return off_centre_events, on_centre_events
 
-    def _calculate_loss_temp_indep(self, predictions, targets, x_start):
-        """
-        Custom loss function to measure performance based on spiking correctness and sparsity.
-        - Penalizes false positives (predicted 1 when target is 0).
-        - Rewards true positives (predicted 1 when target is 1), but only within the current frame to fore come too
-          much spiking.
-        - Does not punish 'wrong' 0 predictions (false negatives or true negatives).
-        - Adds a sparsity penalty to discourage excessive spiking.
-        """
-        x_end = x_start + self.camera_res_x
-        # Apply surrogate_grad
-        surrogate_grad = surrogate.fast_sigmoid(slope=25)
-        # Reward for correct 1s (True Positives) only in current frame
-        if x_end > len(targets):
-            true_positive_reward =torch.cat((surrogate_grad(predictions[x_start:]) * targets[x_start:],
-                                            surrogate_grad(predictions[:x_end % len(targets)]) * targets[:x_end % len(targets)]),0 )
-            n_spikes_in_frame = targets[x_start:].sum().item()
-            n_spikes_in_frame+= targets[:x_end % len(targets)].sum().item()
-        else:
-            true_positive_reward = surrogate_grad(predictions[x_start:x_end]) * targets[x_start:x_end]
-            n_spikes_in_frame = targets[x_start:x_end].sum().item()
+    def load_scene_spikes(self, scene, data_dir):
+        off_centre_path = os.path.join(data_dir, scene, 'off_centre\in_spk', 'input_spikes.pkl')
+        on_centre_path = os.path.join(data_dir, scene, 'on_centre\out_spk', 'output_spikes.pkl')
 
-        # Penalize false positives (predicted 1, but target is 0)
-        false_positive_penalty = surrogate_grad(predictions) * (1 - targets)
+        off_centre_spikes = self._get_spk_file(off_centre_path)
+        on_centre_spikes = self._get_spk_file(on_centre_path)
+
+        return off_centre_spikes, on_centre_spikes
+
+    def _get_spk_file(self, file_path):
+        if not os.path.exists(file_path):
+            print("file does not extist")
+            return []
+        with open(file_path, "rb") as f:
+            file = pickle.load(f)
+        return file
 
 
-        # Sparsity penalty: Encourage the network to spike less overall (average spike activity)
-        sparsity_penalty = torch.mean(predictions)
-
-        weight_true_pos = -1
-        weight_false_pos = 0.5
-        weight_sparsity = 0.1
-        # Total loss:
-        # - Reward for true positives (maximize correct spikes),
-        # - Penalty for false positives (minimize incorrect spikes),
-        # - Sparsity penalty to avoid excessive spiking.
-        total_loss = (
-                weight_true_pos * true_positive_reward.sum() / n_spikes_in_frame +  # reward for correct spikes
-                weight_false_pos * false_positive_penalty.sum() / n_spikes_in_frame +  # penalize incorrect spikes
-                weight_sparsity * sparsity_penalty  # encourage sparse activity
-        )
-        """
-        print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / n_spikes_in_frame)
-        print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / n_spikes_in_frame)
-        print("spartity:" ,sparsity_penalty.item(), weight_sparsity * sparsity_penalty.item())
-        print("loss:", total_loss)
-        """
-        return total_loss
-
-    def _calculate_loss_tempo_aligned(self, predictions, targets):
-        """
-        Custom loss function to measure performance based on spiking correctness and sparsity.
-        - Penalizes false positives (predicted 1 when target is 0).
-        - Rewards true positives (predicted 1 when target is 1).
-        - Does not punish 'wrong' 0 predictions (false negatives or true negatives).
-        - Adds a sparsity penalty to discourage excessive spiking.
-        """
-
-        # Apply surrogate_grad
-        surrogate_grad = surrogate.fast_sigmoid(slope=25)
-        # Reward for correct 1s (True Positives)
-        true_positive_reward = surrogate_grad(predictions) * targets
-
-        # Penalize false positives (predicted 1, but target is 0)
-        false_positive_penalty = surrogate_grad(predictions) * (1 - targets)
-
-
-        # Sparsity penalty: Encourage the network to spike less overall (average spike activity)
-        sparsity_penalty = torch.mean(predictions)
-
-        weight_true_pos = -1
-        weight_false_pos = 0.5
-        weight_sparsity = 0.1
-        # Total loss:
-        # - Reward for true positives (maximize correct spikes),
-        # - Penalty for false positives (minimize incorrect spikes),
-        # - Sparsity penalty to avoid excessive spiking.
-        total_loss = (
-                weight_true_pos * true_positive_reward.sum() / torch.sum(targets) +  # reward for correct spikes
-                weight_false_pos * false_positive_penalty.sum() / torch.sum(targets) +  # penalize incorrect spikes
-                weight_sparsity * sparsity_penalty  # encourage sparse activity
-        )
-        """
-        print("true pos:", true_positive_reward.sum().item(), weight_true_pos * true_positive_reward.sum().item() / targets.sum().item())
-        print("false pos:", false_positive_penalty.sum().item(), weight_false_pos * false_positive_penalty.sum().item() / targets.sum().item())
-        print("spartity:" ,sparsity_penalty.item(), weight_sparsity * sparsity_penalty.item())
-        print("loss:", total_loss)
-        """
-        return total_loss
 
     def _plot_training_history(self, train_loss_history, val_loss_history, train_acc_history, val_acc_history):
         """
