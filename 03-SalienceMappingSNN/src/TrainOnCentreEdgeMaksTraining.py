@@ -4,38 +4,71 @@ import torch
 from PlotTrainingsProgress import PlotTrainingsProgress
 import snntorch as snn
 from tqdm import tqdm
-import copy
 
-def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio=(0.7, 0.15, 0.15), epochs=10,
-                                         early_stopping=False, patience=5, learning_rate=1e-3,
-                                         device_ids=None, plot_progress=True,
-                                         model_dir=r"C:\Users\maxeb\Documents\Radboud\Master\Master Thesis\SNNsalienceMaps\models\VX_TA"):
+def train_on_centre_SNN_mask(ets, data_dir, ignore_file, mode, split_ratio=(0.7, 0.15, 0.15), epochs=10,
+                             early_stopping=False, patience=5, learning_rate=1e-3,
+                             device_ids=None, plot_progress=True,
+                             model_dir=r"C:\Users\maxeb\Documents\Radboud\Master\Master Thesis\SNNsalienceMaps\models\VX_"):
     """
+    Trains a convolutional spiking neural network (SNN) for generating on-centre edge maps using a mask-based
+    training approach. Supports training, validation, and testing across multiple scenes while managing membrane
+    potentials and tracking training statistics.
+
     Parameters:
-    data_dir (str): Path to the dataset directory (where the scene folders are stored).
-    ignore_file (str): Path to the 'ignore.txt' file containing scene folders to ignore.
-    split_ratio (tuple): Ratio for splitting the dataset into train, validation, and test sets. Default is (0.7, 0.15, 0.15).
-    epochs (int): Maximum number of epochs to train. Default is 20.
-    early_stopping (bool): If True, enables early stopping based on validation loss. Default is False.
-    patience (int): Patience for early stopping (only applies if early_stopping=True). Default is 5.
-    learning_rate (float): Learning rate for the Adam optimizer. Default is 1e-3.
-    plot_training (bool): If True, saves a plot of the training and validation loss/accuracy. Default is True.
-    device_ids (tulple): Contains devices to train on, if None trains on initialized device. Default is None
+
+        data_dir (str):
+            Path to the dataset directory (where the scene folders are stored).
+        ignore_file (str):
+            Path to the 'ignore.txt' file containing scene folders to ignore during training.
+        mode (str):
+            Training mode, either "InputMask" or "MembraneMask". Determines the configuration of the SNN layers:
+            - "InputMask": Uses membrane potential resetting in the input layer.
+            - "MembraneMask": Preserves membrane potentials across frames in the input layer.
+        split_ratio (tuple):
+            Ratio for splitting the dataset into training, validation, and test sets. Default is (0.7, 0.15, 0.15).
+        epochs (int):
+            Maximum number of epochs to train. Default is 10.
+        early_stopping (bool):
+            If True, stops training early based on validation loss. Default is False.
+        patience (int):
+            Patience for early stopping (only applies if early_stopping=True). Default is 5.
+        learning_rate (float):
+            Learning rate for the Adam optimizer. Default is 1e-3.
+        device_ids (list or None):
+            List of device IDs for multi-GPU training using `torch.nn.DataParallel`. If None, training occurs on the
+            initialized device. Default is None.
+        plot_progress (bool):
+            If True, saves training progress plots (e.g., loss, true positives) for each epoch and scene. Default is True.
+        model_dir (str):
+            Path to the directory where trained models, plots, and logs will be saved. Default is a predefined directory.
+
+    Returns:
+        None
     """
     if plot_progress:
         ptp = PlotTrainingsProgress()
 
-    # Training mode for temporal aligned:
-    ets.lif_input_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(ets.device)
-    ets.lif_train_output_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(ets.device)
-    ets.input_data_reset = True
-    ets.train_output_data_reset = False
+    if mode == "InputMask":
+        ets.lif_input_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(ets.device)
+        ets.lif_train_output_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(ets.device)
+        ets.input_data_reset = False
+        ets.train_output_data_reset = False
+        reset_mem = True
+    elif mode == "MembraneMaks":
+        ets.lif_input_layer = snn.Leaky(beta=1, threshold=0.5, reset_mechanism="none").to(ets.device)
+        ets.lif_train_output_layer = snn.Leaky(beta=0.1, threshold=0.5, reset_mechanism="subtract").to(ets.device)
+        ets.input_data_reset = True
+        ets.train_output_data_reset = False
+        reset_mem = False
+    else:
+        print("No valid mode. Valid training modes are 'InputMask' and 'MembraneMask' ")
+        return []
 
     train_scenes, val_scenes, test_scenes = ets._split_dataset(data_dir, ignore_file, split_ratio)
-    ets.save_scene_lists(train_scenes, val_scenes, test_scenes, os.path.join(model_dir, "temp_aligned_"))
+    ets.save_scene_lists(train_scenes, val_scenes, test_scenes, os.path.join(model_dir, "{}_".format(mode)))
 
     # Initialize the SNN model and optimizer
-    model = ets.build_on_centre_snn()
+    model = ets.build_convolutional_snn_for_on_centre()
     if device_ids:
         model = torch.nn.DataParallel(model, device_ids=device_ids)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -45,8 +78,6 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
     patience_counter = 0
     train_history = []
     val_history = []
-
-    torch.autograd.set_detect_anomaly(True)
 
     # Training Loop
     for epoch in range(epochs):
@@ -69,27 +100,24 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
             off_centre_spikes, on_centre_spikes = ets._load_scene_data(scene, data_dir)
             train_ls, train_tp, train_fp, train_fn, train_n_spk = [], [], [], [], []
 
-            # Reset membrane potentials
+            # Reset membrane potentials and inputs
             ets.mem_on = None
             ets.mem_off = None
-            model.reset_states()
+            model.reset_state()
             ets.train_output_data = torch.zeros((ets.layer1_n_neurons_x, ets.layer1_n_neurons_y), device=ets.device)
-
-            # Accumulated loss to preserve internal states of model.
-            accumulation_size = 5
+            ets.input_data = torch.zeros((ets.layer1_n_neurons_x, ets.layer1_n_neurons_y), device=ets.device)
             for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(
                     zip(ets.update_events_step_by_step(off_centre_spikes),
                         ets.update_train_events_step_by_step(on_centre_spikes))):
                 x_start = int(ets.layer1_n_neurons_x - x_start)
 
-
+                optimizer.zero_grad()
 
                 # Forward pass without membrane potential reset
                 predictions = model(off_spikes.unsqueeze(0).unsqueeze(0),
-                                    reset_mem=False)  # Add batch and channel dimensions
+                                    reset_mem=reset_mem)  # Add batch and channel dimensions
 
-
-                loss = ets.loss_function_temporal_aligned(predictions.squeeze(), on_spikes, x_start)
+                loss = ets.loss_function_mask_training(predictions.squeeze(), on_spikes, x_start)
 
                 # Update progress Bar
                 tp = ets._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
@@ -106,15 +134,11 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
                     ))
 
                 # Backward pass and optimize
-                loss.backward(retain_graph=True)
-                if frame % accumulation_size == 0:
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    #model.reset_states()
-                    model.detach_states()
-                    # empty cache
-                    torch.cuda.empty_cache()
+                loss.backward()
+                optimizer.step()
 
+                # detach membrane potentials from computational graph
+                model.detach_states()
                 # append statistics
                 train_ls.append(loss.item())
                 train_tp.append(tp)
@@ -124,13 +148,14 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
                 if plot_progress:
                     ptp.update_plot(off_spikes, predictions.squeeze(), on_spikes, train_tp, train_fp, train_ls,
                                     os.path.join(model_dir, "TrainingPlots"), scene + "ep_{}".format(epoch))
-
+                # empty cache
+                torch.cuda.empty_cache()
             # save training statistics per scene
-            train_stats["loss"].append([train_ls[:]])
-            train_stats["tp"].append([train_tp[:]])
-            train_stats["fp"].append([train_fp[:]])
-            train_stats["fn"].append([train_fn[:]])
-            train_stats["n_spk"].append([train_n_spk[:]])
+            train_stats["loss"].append(train_ls)
+            train_stats["tp"].append(train_tp)
+            train_stats["fp"].append(train_fp)
+            train_stats["fn"].append(train_fn)
+            train_stats["n_spk"].append(train_n_spk)
             # clear memory
             train_ls.clear()
             train_tp.clear()
@@ -157,9 +182,10 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
                 # Reset input layer membrane potential
                 ets.mem_on = None
                 ets.mem_off = None
-                model.reset_states()
                 ets.train_output_data = torch.zeros((ets.layer1_n_neurons_x, ets.layer1_n_neurons_y),
                                                      device=ets.device)
+                ets.input_data = torch.zeros((ets.layer1_n_neurons_x, ets.layer1_n_neurons_y),
+                                              device=ets.device)
                 for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(
                         zip(ets.update_events_step_by_step(off_centre_spikes),
                             ets.update_train_events_step_by_step(on_centre_spikes))):
@@ -168,10 +194,9 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
 
                     # Forward pass without membrane potential reset
                     predictions = model(off_spikes.unsqueeze(0).unsqueeze(0),
-                                        reset_mem=False)  # Add batch and channel dimensions
+                                        reset_mem=reset_mem)  # Add batch and channel dimensions
 
-
-                    loss = ets.loss_function_temporal_aligned(predictions.squeeze(), on_spikes, x_start)
+                    loss = ets.loss_function_mask_training(predictions.squeeze(), on_spikes, x_start)
 
                     # Update progress Bar
                     tp = ets._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
@@ -201,11 +226,11 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
                     torch.cuda.empty_cache()
 
                 # save validation statistics  per scene
-                validation_stats["loss"].append([val_ls[:]])
-                validation_stats["tp"].append([val_tp[:]])
-                validation_stats["fp"].append([val_fp[:]])
-                validation_stats["fn"].append([val_fn[:]])
-                validation_stats["n_spk"].append([val_n_spk[:]])
+                validation_stats["loss"].append(val_ls)
+                validation_stats["tp"].append(val_tp)
+                validation_stats["fp"].append(val_fp)
+                validation_stats["fn"].append(val_fn)
+                validation_stats["n_spk"].append(val_n_spk)
                 # clear memory
                 val_ls.clear()
                 val_tp.clear()
@@ -213,15 +238,15 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
                 val_fn.clear()
                 val_n_spk.clear()
 
-        train_history.append(copy.deepcopy(train_stats))
-        val_history.append(copy.deepcopy(validation_stats))
+        train_history.append(train_stats)
+        val_history.append(validation_stats)
 
-    torch.save(model.state_dict(), os.path.join(model_dir, "Temporal_aligned_model.pth"))
+    torch.save(model.state_dict(), os.path.join(model_dir, "{}_model.pth".format(mode)))
 
     torch.cuda.empty_cache()
 
     # Testing
-    model.load_state_dict(torch.load(os.path.join(model_dir, "Temp_aligned_model.pth")))
+    model.load_state_dict(torch.load(os.path.join(model_dir, "{}_model.pth").format(mode)))
     test_history = {"loss": [], "tp": [], "fp": [], "fn": [], "n_spk": []}
     model.eval()
     with torch.no_grad():
@@ -241,9 +266,10 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
             # Reset input layer membrane potential
             ets.mem_on = None
             ets.mem_off = None
-            model.reset_states()
             ets.train_output_data = torch.zeros((ets.layer1_n_neurons_x, ets.layer1_n_neurons_y),
                                                  device=ets.device)
+            ets.input_data = torch.zeros((ets.layer1_n_neurons_x, ets.layer1_n_neurons_y),
+                                          device=ets.device)
             for frame, ((off_spikes, x_start), (on_spikes, _)) in enumerate(
                     zip(ets.update_events_step_by_step(off_centre_spikes),
                         ets.update_train_events_step_by_step(on_centre_spikes))):
@@ -253,9 +279,8 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
                 # Forward pass without membrane potential reset
                 predictions = model(off_spikes.unsqueeze(0).unsqueeze(0),
                                     reset_mem=reset_mem)  # Add batch and channel dimensions
-                reset_mem = False
 
-                loss = ets.loss_function_temporal_aligned(predictions.squeeze(), on_spikes, x_start)
+                loss = ets.loss_function_mask_training(predictions.squeeze(), on_spikes, x_start)
 
                 # Update progress Bar
                 tp = ets._get_tp_to_frame(predictions.squeeze(), on_spikes, x_start)
@@ -285,18 +310,21 @@ def train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, split_ratio
                 torch.cuda.empty_cache()
 
             # save validation statistics  per scene
-            test_history["loss"].append([test_ls[:]])
-            test_history["tp"].append([test_tp[:]])
-            test_history["fp"].append([test_fp[:]])
-            test_history["fn"].append([test_fn[:]])
-            test_history["n_spk"].append([test_n_spk[:]])
+            test_history["loss"].append(test_ls)
+            test_history["tp"].append(test_tp)
+            test_history["fp"].append(test_fp)
+            test_history["fn"].append(test_fn)
+            test_history["n_spk"].append(test_n_spk)
 
-    ets.save_training_history(train_history, val_history, test_history, save_dir=os.path.join(model_dir, "training_logs"))  # shapes (epoch, dict), (epochs, dict), (dict)
-    
+    ets.save_training_history(train_history, val_history, test_history, save_dir=os.path.join(model_dir,
+                                                                                               "training_logs"))  # shapes (epoch, dict), (epochs, dict), (dict)
+
 if __name__ == "__main__":
     ets = EventToSalienceMap()
     data_dir = r"D:\MasterThesisDataSet"
-    ignore_file = os.path.join(data_dir, "ignore.txt")
-    model_dir = r"C:\Users\maxeb\Documents\Radboud\Master\Master Thesis\SNNsalienceMaps\models\V2_TA"
+    modes = ["InputMask", "MembraneMaks"]
+    mode = modes[1]
+    model_dir = r"C:\Users\maxeb\Documents\Radboud\Master\Master Thesis\SNNsalienceMaps\models\V1_Test_{}".format(mode)
     os.makedirs(model_dir, exist_ok=True)
-    train_on_centre_SNN_temporal_aligned(ets, data_dir, ignore_file, epochs=1, model_dir=model_dir)
+    ignore_file = os.path.join(data_dir, "ignore.txt")
+    train_on_centre_SNN_mask(ets, data_dir, ignore_file, mode = mode, model_dir=model_dir, epochs=1)
