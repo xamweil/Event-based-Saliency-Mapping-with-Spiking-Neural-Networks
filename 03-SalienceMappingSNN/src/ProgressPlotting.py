@@ -4,22 +4,22 @@ from matplotlib.gridspec import GridSpec
 import numpy as np
 import torch
 
-class PocPlotTrainingsProgress:
-    def __init__(self, input_size_x, input_size_y, output_size_x, output_size_y, nr_scenes):
+class ProgessPlotting:
+    def __init__(self, nr_scenes, output_size_x =1280, output_size_y = 720):
         self.fig = plt.figure(figsize=(12, 8))
         gs = GridSpec(3, 1, figure=self.fig, height_ratios=[1, 1, 1])
-        gs_row0 = gs[0].subgridspec(1, 3)  # Nested GridSpec for first row
+        gs_row0 = gs[0].subgridspec(1, 2)  # Nested GridSpec for first row
 
-        ax0 = self.fig.add_subplot(gs_row0[0, 0])  # First subplot
-        ax1 = self.fig.add_subplot(gs_row0[0, 1])  # Second subplot
-        ax2 = self.fig.add_subplot(gs_row0[0, 2])  # Third subplot
+
+        ax1 = self.fig.add_subplot(gs_row0[0, 0])  # Second subplot
+        ax2 = self.fig.add_subplot(gs_row0[0, 1])  # Third subplot
 
         ax3 = self.fig.add_subplot(gs[1, 0])
         ax4 = self.fig.add_subplot(gs[2, 0])
 
-        self.ax = [ax0, ax1, ax2, ax3, ax4]
+        self.ax = ["Don't ask", ax1, ax2, ax3, ax4]
 
-        self.input_layer = self.ax[0].imshow(np.zeros(input_size_x*input_size_y).reshape((input_size_x, input_size_y)).T, cmap='gray', vmin=0, vmax=1)
+        #self.input_layer = self.ax[0].imshow(np.zeros(input_size_x*input_size_y).reshape((input_size_x, input_size_y)).T, cmap='gray', vmin=0, vmax=1)
         self.prediction_layer = self.ax[1].imshow(np.zeros(output_size_x*output_size_y).reshape((output_size_x, output_size_y)).T, cmap='gray', vmin=0, vmax=1)
         self.train_layer = self.ax[2].imshow(np.zeros(output_size_x*output_size_y).reshape((output_size_x, output_size_y)).T, cmap='gray', vmin=0, vmax=1)
 
@@ -27,7 +27,7 @@ class PocPlotTrainingsProgress:
         self.graph_fp, = self.ax[3].plot([], [], label="False Positive")
         self.graph_ls, = self.ax[4].plot([], [], label="Loss")
 
-        self.ax[0].title.set_text("Input Layer")
+        #self.ax[0].title.set_text("Input Layer")
         self.ax[1].title.set_text("Prediction Layer")
         self.ax[2].title.set_text("Trainings Layer")
         self.ax[3].title.set_text("Progress")
@@ -48,18 +48,19 @@ class PocPlotTrainingsProgress:
         self.fig.show()
         self.fig.canvas.flush_events()
 
-    def update_scene(self, mode, scene):
-        self.ax[3].title.set_text(mode + " Progress ")
+    def update_scene(self, mode, gradient_norm=None):
+        if gradient_norm:
+            self.ax[3].title.set_text(f"Training Progress: Last gradient norm={gradient_norm}")
+        else:
+            self.ax[3].title.set_text(mode + " Progress")
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
 
-    def update_plot(self, input, prediction, target, tp, fp, ls, dir, scene, frame, train_frame):
+    def update_plot(self, prediction, target, tp, fp, ls, dir, scene):
         # Directly update image layers
-        self.input_layer.set_data(input.detach().cpu().numpy().T)
-        self.input_layer.set_clim(vmin=0, vmax=1)
-        self.prediction_layer.set_data(prediction.detach().cpu().numpy().T)
+        self.prediction_layer.set_data(prediction.detach().cpu().numpy())
         self.prediction_layer.set_clim(vmin=0, vmax=1)
-        self.train_layer.set_data(target.detach().cpu().numpy().T)
+        self.train_layer.set_data(target.detach().cpu().numpy())
         self.train_layer.set_clim(vmin=0, vmax=1)
 
         # Update graph data
@@ -75,9 +76,9 @@ class PocPlotTrainingsProgress:
         self.fig.canvas.flush_events()
 
         # Save plot
-        self.save_plot(dir, scene, train_frame, frame)
+        self.save_plot(dir, scene)
 
-    def save_plot(self, dir, scene, train_frame, frame):
+    def save_plot(self, dir, scene):
         """
            Save the plot to a file with a fixed size without affecting the display size.
 
@@ -96,7 +97,7 @@ class PocPlotTrainingsProgress:
         self.fig.set_size_inches(10, 7)
 
         # Save the figure
-        self.fig.savefig(os.path.join(dir, "{sc}_{tfr}_{fr}.pdf".format(sc=scene, tfr=train_frame, fr=frame)), format="pdf")
+        self.fig.savefig(os.path.join(dir, "{sc}.pdf".format(sc=scene)), format="pdf")
 
         # Restore original size
         self.fig.set_size_inches(original_size)
